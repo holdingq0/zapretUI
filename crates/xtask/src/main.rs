@@ -1,8 +1,8 @@
 // Release tooling, run by hand on the developer's machine:
 //   cargo xtask keygen             once: makes the signing key, writes its public half to resources/release.toml
 //   cargo xtask release [--dry-run] [--notes FILE]
-//                                  builds the installer, the portable zip and the update files,
-//                                  signs manifest.json, publishes GitHub release v<version> with `gh`
+//                                  builds the installer, the portable zip and the signed update file,
+//                                  publishes GitHub release v<version> with these three files via `gh`
 // The private key stays in %USERPROFILE%\.zapretUI\release.key and never enters the repository.
 
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use anyhow::{Context, bail, ensure};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use rkn_core::paths::{APP_EXE, PORTABLE_MARK, PRODUCT, SERVICE_EXE};
-use rkn_core::release::{FileEntry, MANIFEST, Manifest, Place, SIGNATURE, hex, unhex};
+use rkn_core::release::{FileEntry, Manifest, Place, hex, pack, split, unhex, unpack, update_asset};
 use serde::Deserialize;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -103,6 +103,25 @@ fn copy(from: &Path, to: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reads the update back the way the service will: signature against the public key in
+/// release.toml, version, every file against its hash.
+fn check_update(path: &Path, public: &str) -> anyhow::Result<()> {
+    let bytes = std::fs::read(path)?;
+    let (manifest_bytes, signature, body) = unpack(&bytes).context("файл обновления не читается")?;
+    let key = unhex(public).context("ключ в release.toml")?;
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
+        .verify(manifest_bytes, signature)
+        .map_err(|_| anyhow::anyhow!("подпись файла обновления не сходится с ключом"))?;
+    let manifest: Manifest = serde_json::from_slice(manifest_bytes)?;
+    ensure!(manifest.version == VERSION, "версия в файле обновления не {VERSION}");
+    let parts = split(&manifest, body).context("размеры файлов в обновлении не сходятся")?;
+    for (entry, data) in manifest.files.iter().zip(parts) {
+        ensure!(hex(ring::digest::digest(&ring::digest::SHA256, data).as_ref()) == entry.sha256, "{} не совпадает с хешем", entry.path);
+    }
+    println!("Файл обновления проверен: {} файлов, подпись верна", manifest.files.len());
+    Ok(())
+}
+
 fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
@@ -141,13 +160,13 @@ fn release(dry_run: bool, notes: Option<PathBuf>) -> anyhow::Result<()> {
     let mut entries: Vec<(FileEntry, PathBuf)> = Vec::new();
     for exe in [APP_EXE, SERVICE_EXE] {
         copy(&built.join(exe), &program.join(exe))?;
-        let entry = FileEntry { place: Place::Bin, path: exe.to_string(), sha256: sha256(&built.join(exe))? };
+        let entry = FileEntry { place: Place::Bin, path: exe.to_string(), size: std::fs::metadata(built.join(exe))?.len(), sha256: sha256(&built.join(exe))? };
         entries.push((entry, built.join(exe)));
     }
     for file in engine_files(&winws2)? {
         let from = file.split('/').fold(winws2.clone(), |p, part| p.join(part));
         copy(&from, &file.split('/').fold(program.join("winws2"), |p, part| p.join(part)))?;
-        let entry = FileEntry { place: Place::Engine, path: file.clone(), sha256: sha256(&from)? };
+        let entry = FileEntry { place: Place::Engine, path: file.clone(), size: std::fs::metadata(&from)?.len(), sha256: sha256(&from)? };
         entries.push((entry, from));
     }
 
@@ -167,20 +186,15 @@ fn release(dry_run: bool, notes: Option<PathBuf>) -> anyhow::Result<()> {
     let zip = dist.join(format!("{name}.zip"));
     run(Command::new("tar").current_dir(&dist).arg("-a").arg("-c").arg("-f").arg(&zip).arg(&name))?;
 
-    // Update files: flat assets, the manifest and its signature.
-    let assets = dist.join("assets");
+    // The update: one file with the signed list of files and the files themselves.
     let manifest = Manifest { version: VERSION.to_string(), files: entries.iter().map(|(e, _)| e.clone()).collect() };
-    for (entry, from) in &entries {
-        copy(from, &assets.join(entry.asset()))?;
-    }
-    let body = serde_json::to_vec_pretty(&manifest)?;
-    std::fs::write(assets.join(MANIFEST), &body)?;
-    std::fs::write(assets.join(SIGNATURE), pair.sign(&body).as_ref())?;
+    let body = serde_json::to_vec(&manifest)?;
+    let contents = entries.iter().map(|(_, from)| std::fs::read(from)).collect::<Result<Vec<_>, _>>()?;
+    let update = dist.join(update_asset(VERSION));
+    std::fs::write(&update, pack(&body, pair.sign(&body).as_ref(), &contents))?;
+    check_update(&update, &source.key)?;
 
-    let mut files: Vec<PathBuf> = vec![setup, zip];
-    for entry in std::fs::read_dir(&assets)? {
-        files.push(entry?.path());
-    }
+    let files: Vec<PathBuf> = vec![setup, zip, update];
     println!("Готово: {}", dist.display());
     if dry_run {
         println!("--dry-run: релиз {tag} не опубликован");

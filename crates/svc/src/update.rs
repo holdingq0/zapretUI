@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, ensure};
 use rkn_core::ipc::{Level, UpdateState};
 use rkn_core::paths;
-use rkn_core::release::{FileEntry, MANIFEST, Manifest, Place, SIGNATURE, unhex};
+use rkn_core::release::{FileEntry, Manifest, Place, split, unhex, unpack, update_asset};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -30,7 +30,7 @@ const FIRST_CHECK: Duration = Duration::from_secs(90);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 const RETRY_BUSY: Duration = Duration::from_secs(20 * 60);
 const KEEP_OLD: Duration = Duration::from_secs(120);
-const MAX_FILE: usize = 64 * 1024 * 1024;
+const MAX_UPDATE: usize = 128 * 1024 * 1024;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
@@ -205,30 +205,30 @@ fn latest(repo: &str) -> anyhow::Result<Option<Release>> {
 
 /// Downloads and checks everything the release changes; returns the files to put in place.
 fn download(release: &Release, key: &[u8]) -> anyhow::Result<Vec<(FileEntry, PathBuf)>> {
-    let manifest_bytes = get(&release.asset(MANIFEST)?.browser_download_url, "application/octet-stream", 1024 * 1024)?;
-    let signature = get(&release.asset(SIGNATURE)?.browser_download_url, "application/octet-stream", 1024)?;
+    let asset = release.asset(&update_asset(release.version()))?;
+    let bytes = get(&asset.browser_download_url, "application/octet-stream", MAX_UPDATE)?;
+    let (manifest_bytes, signature, body) = unpack(&bytes).context("файл обновления повреждён")?;
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
-        .verify(&manifest_bytes, &signature)
-        .map_err(|_| anyhow!("подпись релиза не совпадает, обновление отклонено"))?;
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).context("manifest.json")?;
-    ensure!(manifest.version == release.version(), "версия в манифесте не совпадает с релизом");
+        .verify(manifest_bytes, signature)
+        .map_err(|_| anyhow!("подпись обновления не совпадает, обновление отклонено"))?;
+    let manifest: Manifest = serde_json::from_slice(manifest_bytes).context("список файлов обновления")?;
+    ensure!(manifest.version == release.version(), "версия в обновлении не совпадает с релизом");
     ensure!(paths::newer(&manifest.version, env!("CARGO_PKG_VERSION")), "релиз не новее установленной версии");
 
     let dir = paths::update_dir();
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let mut out = Vec::new();
-    for entry in manifest.files {
-        let to = target(&entry)?;
+    let parts = split(&manifest, body).context("файл обновления обрезан")?;
+    for (n, (entry, data)) in manifest.files.iter().zip(parts).enumerate() {
+        ensure!(sha256(data).eq_ignore_ascii_case(&entry.sha256), "{} повреждён", entry.path);
+        let to = target(entry)?;
         if sha256_file(&to).is_some_and(|h| h.eq_ignore_ascii_case(&entry.sha256)) {
             continue;
         }
-        let asset = release.asset(&entry.asset())?;
-        let bytes = get(&asset.browser_download_url, "application/octet-stream", MAX_FILE)?;
-        ensure!(sha256(&bytes).eq_ignore_ascii_case(&entry.sha256), "{} повреждён при загрузке", entry.path);
-        let file = dir.join(entry.asset());
-        std::fs::write(&file, &bytes)?;
-        out.push((entry, file));
+        let file = dir.join(n.to_string());
+        std::fs::write(&file, data)?;
+        out.push((entry.clone(), file));
     }
     ensure!(!out.is_empty(), "в релизе нет изменённых файлов");
     Ok(out)

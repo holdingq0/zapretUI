@@ -1,18 +1,25 @@
-// What a GitHub release of zapretUI carries besides the zip for first installs:
-// every file on its own, manifest.json with their hashes and manifest.sig, an Ed25519 signature
-// of manifest.json made with the key whose public half is built into zapretUI-svc.exe.
+// How a GitHub release carries an update: one file, zapretUI-update-<version>.bin, next to the
+// installer and the portable zip. Inside: the manifest (version, every file with its size and
+// sha256), an Ed25519 signature of the manifest made with the key whose public half is built into
+// zapretUI-svc.exe, then the files themselves in manifest order.
+//
+//   "ZUIUPD01" | manifest length (u32 LE) | manifest JSON | signature (64 bytes) | files
 
 use serde::{Deserialize, Serialize};
 
-pub const MANIFEST: &str = "manifest.json";
-pub const SIGNATURE: &str = "manifest.sig";
+const MAGIC: &[u8; 8] = b"ZUIUPD01";
+pub const SIGNATURE_LEN: usize = 64;
+
+pub fn update_asset(version: &str) -> String {
+    format!("zapretUI-update-{version}.bin")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Place {
-    /// Program Files\zapretUI: the app and the service.
+    /// Program Files\zapretUI (or the portable folder): the app and the service.
     Bin,
-    /// ProgramData\zapretUI\engine: winws2 and its files.
+    /// The engine folder: winws2 and its files.
     Engine,
 }
 
@@ -21,23 +28,51 @@ pub struct FileEntry {
     pub place: Place,
     /// Path inside its place, with forward slashes ("lua/zapret-lib.lua").
     pub path: String,
+    pub size: u64,
     pub sha256: String,
-}
-
-impl FileEntry {
-    /// Release assets are flat: "engine.lua.zapret-lib.lua" for engine files, the name itself for the rest.
-    pub fn asset(&self) -> String {
-        match self.place {
-            Place::Bin => self.path.clone(),
-            Place::Engine => format!("engine.{}", self.path.replace('/', ".")),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
     pub files: Vec<FileEntry>,
+}
+
+pub fn pack(manifest: &[u8], signature: &[u8], files: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(manifest.len() + files.iter().map(Vec::len).sum::<usize>() + 80);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
+    out.extend_from_slice(manifest);
+    out.extend_from_slice(signature);
+    for file in files {
+        out.extend_from_slice(file);
+    }
+    out
+}
+
+/// Splits a downloaded update into (manifest, signature, files). Nothing in it is trusted yet.
+pub fn unpack(bytes: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let rest = bytes.strip_prefix(MAGIC.as_slice())?;
+    let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    let manifest = rest.get(4..4 + len)?;
+    let signature = rest.get(4 + len..4 + len + SIGNATURE_LEN)?;
+    let files = rest.get(4 + len + SIGNATURE_LEN..)?;
+    Some((manifest, signature, files))
+}
+
+/// Cuts the files part into one slice per manifest entry, in order; None if the sizes do not add up.
+pub fn split<'a>(manifest: &Manifest, mut files: &'a [u8]) -> Option<Vec<&'a [u8]>> {
+    let mut out = Vec::with_capacity(manifest.files.len());
+    for entry in &manifest.files {
+        let size = usize::try_from(entry.size).ok()?;
+        if files.len() < size {
+            return None;
+        }
+        let (data, rest) = files.split_at(size);
+        out.push(data);
+        files = rest;
+    }
+    files.is_empty().then_some(out)
 }
 
 pub fn hex(bytes: &[u8]) -> String {
