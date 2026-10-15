@@ -139,6 +139,8 @@ pub struct Ui {
     pub missing: bool,
     /// Installed, but the service does not answer: the button starts it.
     pub stopped: bool,
+    /// A portable copy asked Windows to start its service a moment ago.
+    pub launching: bool,
     pub focused: bool,
     pub hover: Option<Hit>,
     pub press: Option<Hit>,
@@ -217,6 +219,7 @@ impl Ui {
             screen: Screen::Home,
             missing: false,
             stopped: false,
+            launching: false,
             focused: false,
             hover: None,
             press: None,
@@ -281,7 +284,7 @@ impl Ui {
         } else {
             self.learn.set(percent, now);
         }
-        let view = text::view(connected, self.missing, self.stopped, status);
+        let view = text::view(connected, self.missing, self.stopped, self.launching, status);
         if view.title != self.title.0 {
             self.title = (view.title, now);
         }
@@ -673,7 +676,7 @@ impl Ui {
             self.label(c, &l, (W - 310.0) / 2.0, ty + 44.0, t.soft, k);
         }
 
-        let view = text::view(true, self.missing, self.stopped, status);
+        let view = text::view(true, self.missing, self.stopped, self.launching, status);
         let mut below = ty + 44.0 + sub_h.max(16.0) + 14.0;
         let learn = status.and_then(|s| s.learn.as_ref()).filter(|_| learning);
         if let Some(learn) = learn {

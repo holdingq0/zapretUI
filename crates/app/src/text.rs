@@ -24,7 +24,7 @@ pub fn phase(phase: Phase) -> &'static str {
     match phase {
         Phase::Probing => "Смотрю, что режет провайдер",
         Phase::Round1 => "Пробую способы обхода",
-        Phase::Round2 => "Проверяю лучшие на всех сервисах",
+        Phase::Round2 => "Перепроверяю лучшие способы",
         Phase::Done => "Готово, запомнил для этой сети",
         Phase::Failed => "Настройка остановлена",
     }
@@ -36,8 +36,12 @@ pub struct View {
     pub action: Option<&'static str>,
 }
 
-pub fn view(connected: bool, missing: bool, stopped: bool, status: Option<&Status>) -> View {
+pub fn view(connected: bool, missing: bool, stopped: bool, launching: bool, status: Option<&Status>) -> View {
     let v = |title: &str, sub: String, action: Option<&'static str>| View { title: title.into(), sub, action };
+    // The request was confirmed: the service is on its way, there is nothing to ask for any more.
+    if missing && launching && rkn_core::paths::portable() {
+        return v("Запуск", "Запускаю службу обхода".into(), None);
+    }
     if missing && rkn_core::paths::portable() {
         return v("Не запущено", "Нужны права администратора: подтвердите запрос Windows".into(), Some("Запустить"));
     }
@@ -68,7 +72,15 @@ pub fn view(connected: bool, missing: bool, stopped: bool, status: Option<&Statu
         State::Paused => v("Выключено", String::new(), None),
         State::Starting => v("Запуск", "Включаю обход".into(), None),
         State::Learning => {
-            let sub = status.learn.as_ref().map(|l| phase(l.phase).to_string()).unwrap_or_else(|| "Подбираю способ под вашего провайдера".into());
+            // While it looks at the sites, the line says why the search started; then what it does.
+            let sub = match status.learn.as_ref() {
+                Some(l) if l.phase == Phase::Probing => match &l.reason {
+                    Some(reason) => format!("{reason}. {}", phase(l.phase)),
+                    None => phase(l.phase).to_string(),
+                },
+                Some(l) => phase(l.phase).to_string(),
+                None => "Подбираю способ под вашего провайдера".into(),
+            };
             v("Настраиваю", sub, Some("Остановить"))
         }
         State::Tuning => v("Нужна настройка", message().unwrap_or_else(|| "Провайдер что-то поменял".into()), Some("Настроить")),

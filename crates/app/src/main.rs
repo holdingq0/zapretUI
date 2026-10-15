@@ -17,6 +17,7 @@ mod ui;
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rkn_core::config::Config;
 use rkn_core::paths;
@@ -77,6 +78,8 @@ struct App {
     autostart: bool,
     /// A GetConfig is on its way; not asked again until it answers.
     config_asked: bool,
+    /// When a portable copy asked Windows to start its service: the window says it is starting.
+    launching: Option<Instant>,
     taskbar_created: u32,
     /// A newer copy is taking over; ignore further triggers until we are gone.
     leaving: bool,
@@ -97,6 +100,7 @@ enum Tag {
     Saved,
     Installed,
     Autostart,
+    Launched,
 }
 
 struct Reply {
@@ -190,7 +194,7 @@ fn launch_portable(tray: HWND) {
         if pipe::request(&Request::Status).is_ok() {
             return;
         }
-        reply(HWND(target as *mut _), Tag::Plain, admin::run_svc("portable", false).map(|_| Message::Ok));
+        reply(HWND(target as *mut _), Tag::Launched, admin::run_svc("portable", false).map(|_| Message::Ok));
     });
 }
 
@@ -307,6 +311,7 @@ fn main() {
             config: None,
             autostart: autostart::enabled(),
             config_asked: false,
+            launching: None,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             leaving: false,
         })
@@ -424,7 +429,7 @@ fn exit() {
             let _ = pipe::request(&Request::Shutdown);
             let _ = done.send(());
         });
-        let _ = wait.recv_timeout(std::time::Duration::from_millis(1500));
+        let _ = wait.recv_timeout(Duration::from_millis(1500));
     }
     quit();
 }
@@ -504,6 +509,10 @@ fn on_reply(app: &mut App, reply: Reply) {
     if matches!(reply.tag, Tag::Config) {
         app.config_asked = false;
     }
+    // Confirmed: the service starts within seconds. Declined: the window asks again.
+    if matches!(reply.tag, Tag::Launched) {
+        app.launching = problem.is_none().then(Instant::now);
+    }
     match (reply.tag, reply.result) {
         (Tag::Config, Ok(Message::Config(config))) => app.config = Some(config),
         (Tag::Saved, _) if problem.is_some() => send(app.tray_hwnd, Tag::Config, Request::GetConfig),
@@ -571,11 +580,12 @@ fn after(hwnd: HWND, act: Option<Act>) {
 }
 
 fn paint(app: &mut App) {
-    let App { store, main, theme, config, autostart, .. } = app;
+    let App { store, main, theme, config, autostart, launching, .. } = app;
     let Some(main) = main else { return };
     let shared = store.lock().unwrap_or_else(|e| e.into_inner());
     main.ui.missing = !shared.connected && (paths::portable() || shared.installed == Some(false));
     main.ui.stopped = !shared.connected && !paths::portable() && shared.installed == Some(true);
+    main.ui.launching = !shared.connected && launching.is_some_and(|at| at.elapsed() < Duration::from_secs(40));
     main.ui.sync(shared.connected, shared.status.as_ref(), config.as_ref(), *autostart);
     if main.canvas.is_none() {
         let mut r = RECT::default();

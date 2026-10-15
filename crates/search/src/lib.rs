@@ -367,10 +367,16 @@ pub async fn search(job: &Job, progress: &(dyn Fn(View) + Send + Sync)) -> anyho
         if batch.is_empty() {
             break;
         }
-        let text = if batch_no == 0 {
-            format!("{} {} обхода из {total}", batch.len(), variants(batch.len()))
-        } else {
-            format!("Ещё {} {} взамен отсеянных", batch.len(), variants(batch.len()))
+        let n = batch.len();
+        let text = match batch_no {
+            0 if !job.seed.is_empty() => {
+                format!("Прежние способы и ещё {} {} из {total}", n - job.seed.len().min(n), likely(n - job.seed.len().min(n)))
+            }
+            0 => format!("{n} {} {} из {total}", likely(n), variants_gen(n)),
+            _ => {
+                let won = tested.iter().filter(|(_, s)| s.total() == first.len()).count();
+                format!("Подошли {won} из {}, проверяю ещё {n}", tested.len())
+            }
         };
         board.say(LineKind::Stage, "Этап 1", text);
 
@@ -434,7 +440,7 @@ pub async fn search(job: &Job, progress: &(dyn Fn(View) + Send + Sync)) -> anyho
     board.say(
         LineKind::Stage,
         "Этап 2",
-        format!("Прошли {winners} из {tried}. Лучшие {} — на {} {}", order.len(), all.len(), sites_word(all.len())),
+        format!("Открыли все сайты {winners} из {tried}. Перепроверяю {} лучших на {} {}", order.len(), all.len(), sites_word(all.len())),
     );
     let recipes: Vec<Recipe> = order.iter().map(|t| tested[*t].0.recipe.clone()).collect();
     let n = recipes.len() as f32;
@@ -506,6 +512,20 @@ pub async fn search(job: &Job, progress: &(dyn Fn(View) + Send + Sync)) -> anyho
     let unfixed = hosts_of(&job.hits, 0..job.hits.len()).into_iter().filter(|h| !fixed.contains(h)).collect();
     let recipes = chosen.into_iter().map(|i| recipes[ranked[i].0].clone()).collect();
     Ok(Found { recipes, fixed, unfixed, tried })
+}
+
+fn likely(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, h) if h != 11 => "самый вероятный",
+        _ => "самых вероятных",
+    }
+}
+
+fn variants_gen(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, h) if h != 11 => "вариант",
+        _ => "вариантов",
+    }
 }
 
 fn variants(n: usize) -> &'static str {

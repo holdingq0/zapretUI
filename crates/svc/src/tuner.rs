@@ -167,7 +167,8 @@ fn diagnosis(probe: &Probed) -> Option<LogLine> {
         Verdict::Cut => format!("Обрыв загрузки на {} КБ", outcome.bytes.div_ceil(1024)),
         Verdict::HttpBlocked if outcome.detail.contains("заглушк") => "Перенаправление на заглушку провайдера".to_string(),
         Verdict::HttpBlocked => "HTTP-запрос глушится".to_string(),
-        Verdict::IpBlocked => "Заблокирован по IP-адресу, пропущен".to_string(),
+        Verdict::IpBlocked if outcome.detail.starts_with("часть") => "Часть адресов закрыта по IP, обход не поможет".to_string(),
+        Verdict::IpBlocked => "Адрес не отвечает: блокировка по IP, обход не поможет".to_string(),
         Verdict::DnsSpoofed => "Подмена DNS, лечится DoH".to_string(),
         Verdict::Geoblocked => "Сервис закрыт для России".to_string(),
         _ => return None,
@@ -276,7 +277,9 @@ async fn learn_with(hub: &Hub, ctx: &LearnCtx) -> Learned {
             .iter()
             .filter(|p| !p.control && p.target.tls == tls && p.outcome.verdict.fixable())
             .filter_map(|p| {
-                let core = targets::service_of(&p.target.host).is_some();
+                // Catalog services the old strategy could not fix go last: a site no strategy opens
+                // would fail every candidate of the first round.
+                let core = targets::service_of(&p.target.host).is_some() && !ctx.unfixed.contains(&p.target.host);
                 Some(Hit { target: p.target.clone(), ip: p.outcome.ip?, verdict: p.outcome.verdict, core })
             })
             .collect()

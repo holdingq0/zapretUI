@@ -143,7 +143,12 @@ pub async fn fetch(target: &Target, ip: IpAddr, ports: Option<&PortBlock>, opts:
 pub async fn probe(target: &Target, ports: Option<&PortBlock>, opts: Opts) -> Outcome {
     let system = system_global(&target.host).await;
     let mut last: Option<Outcome> = None;
-    for ip in system.iter().take(2) {
+    // A single address gets a second try: one lost connection is not a block by IP.
+    let tries: Vec<IpAddr> = match system.as_slice() {
+        [only] => vec![*only, *only],
+        many => many.iter().take(2).copied().collect(),
+    };
+    for ip in &tries {
         let outcome = fetch(target, *ip, ports, opts).await;
         let retry = outcome.verdict == Verdict::IpBlocked;
         if outcome.verdict == Verdict::Ok {
@@ -155,16 +160,25 @@ pub async fn probe(target: &Target, ports: Option<&PortBlock>, opts: Opts) -> Ou
         }
     }
     if last.as_ref().is_none_or(|o| o.verdict == Verdict::IpBlocked) {
+        // No address from the system resolver, or none of them answers: big services rotate
+        // addresses, and another one may be reachable.
+        let spoofed = system.is_empty();
         for ip in doh_global(&target.host, &system).await.iter().take(2) {
             let outcome = fetch(target, *ip, ports, opts).await;
             if outcome.verdict == Verdict::Ok {
-                return Outcome {
-                    verdict: Verdict::DnsSpoofed,
-                    detail: "провайдер выдаёт неверный адрес, по DoH сайт открывается".into(),
-                    ..outcome
+                // Only a resolver that gave no real address is lying. One that gave a blocked
+                // address of the same service is not, and DoH would not fix the browser either.
+                return match spoofed {
+                    true => Outcome {
+                        verdict: Verdict::DnsSpoofed,
+                        detail: "провайдер выдаёт неверный адрес, по DoH сайт открывается".into(),
+                        ..outcome
+                    },
+                    false => Outcome::new(Verdict::IpBlocked, outcome.ip, "часть адресов сервиса заблокирована по IP"),
                 };
             }
-            if last.is_none() {
+            // Reachable at another address, and there the name is blocked: that is DPI, and the bypass helps.
+            if outcome.verdict.fixable() || last.is_none() {
                 last = Some(outcome);
             }
         }

@@ -119,6 +119,9 @@ pub struct Learn {
     pub phase: Phase,
     pub percent: u8,
     pub log: Vec<LogLine>,
+    /// Why this search runs: a new network, a service that stopped opening, or the button.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

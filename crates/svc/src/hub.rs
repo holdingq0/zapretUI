@@ -48,6 +48,8 @@ pub struct LearnCtx {
     pub extra: Vec<String>,
     /// The strategies that worked here before: a new search tries them first.
     pub seed: Reserve,
+    /// Hosts the old strategy could not fix.
+    pub unfixed: Vec<String>,
 }
 
 struct Inner {
@@ -687,14 +689,20 @@ impl Hub {
             None => "Переподбираю способ обхода".into(),
         };
         self.emit(Event::new(Level::Info, text));
+        let why = match reason {
+            _ if first => "Первый запуск в этой сети".to_string(),
+            Some(reason) => reason,
+            None => "Запущено вручную".to_string(),
+        };
         inner.learning = Some(phase_text(Phase::Probing).into());
-        inner.learn = Some(Box::new(Learn { phase: Phase::Probing, percent: 0, log: Vec::new() }));
+        inner.learn = Some(Box::new(Learn { phase: Phase::Probing, percent: 0, log: Vec::new(), reason: Some(why) }));
         self.publish(&mut inner);
         Some(LearnCtx {
             network: inner.network.clone(),
             engine_dir: inner.engine.dir().to_path_buf(),
             extra: inner.extra_hosts(),
             seed: inner.reserve(),
+            unfixed: inner.memory.as_ref().map(|m| m.unfixed.clone()).unwrap_or_default(),
         })
     }
 
@@ -1201,7 +1209,7 @@ fn phase_text(phase: Phase) -> &'static str {
     match phase {
         Phase::Probing => "Проверяю, какие сайты режет провайдер",
         Phase::Round1 => "Этап 1 из 2: проверяю варианты обхода",
-        Phase::Round2 => "Этап 2 из 2: проверяю лучшие варианты на всех сайтах",
+        Phase::Round2 => "Этап 2 из 2: перепроверяю лучшие варианты",
         Phase::Done => "Готово",
         Phase::Failed => "Подбор не удался",
     }
