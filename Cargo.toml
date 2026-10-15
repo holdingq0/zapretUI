@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/engine", "crates/probe", "crates/search", "crates/svc", "crates/app", "crates/setup", "crates/xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+rkn-core = { path = "crates/core" }
+rkn-engine = { path = "crates/engine" }
+rkn-probe = { path = "crates/probe" }
+rkn-search = { path = "crates/search" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process", "fs", "signal", "net"] }
+interprocess = { version = "2.4", features = ["tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  "Win32_System_Memory",
+] }
+windows-service = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
+panic = "abort"

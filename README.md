@@ -1,0 +1,38 @@
+# zapretUI
+
+Обход блокировок для Windows: YouTube, Discord, Twitch, игры и лаунчеры. Программа сама находит, что режет провайдер, подбирает способ обхода под вашу сеть и запоминает его.
+
+## Скачать
+
+В [последнем релизе](../../releases/latest) два варианта:
+
+- **`zapretUI-setup-<версия>.exe`** — установка. Ставит программу в `C:\Program Files\zapretUI`, добавляет ярлык в «Пуск» и запись в «Установленные приложения», откуда её можно удалить.
+- **`zapretUI-portable-<версия>.zip`** — портативная версия. Распакуйте в любую папку и запустите `zapretUI.exe`. В систему ничего не ставится, настройки хранятся в той же папке. При каждом запуске Windows просит права администратора: без них перехват трафика не работает. Если включить «Запускать с Windows», запрос будет только один раз, при включении.
+
+## Обновления
+
+Программа сама проверяет новые версии и ставит их, когда вы не в игре. Это можно выключить в настройках и обновляться кнопкой. Обновление ставится, только если оно подписано ключом проекта.
+
+## Сборка
+
+Нужны Rust 1.85+ и Windows SDK.
+
+```
+cargo build --release -p rkn-svc -p rkn-app
+```
+
+Файлы движка (`winws2.exe`, `cygwin1.dll`, `WinDivert.dll`, `WinDivert64.sys`, `lua/*.lua`) возьмите из релиза [zapret2](https://github.com/bol-van/zapret2) v1.0.5.2 и положите в `resources/winws2`. Хеши сверяются с `resources/winws2/SHA256SUMS`.
+
+## Выпуск версии
+
+1. Один раз: `cargo xtask keygen`. Закрытый ключ ляжет в `%USERPROFILE%\.zapretUI\release.key`, сохраните его копию.
+2. Поднимите `version` в `Cargo.toml`.
+3. `cargo xtask release --notes notes.md` соберёт установщик, портативный zip и файлы обновления и опубликует релиз через `gh`. С `--dry-run` всё соберётся в `target/dist` без публикации.
+
+## Лицензии
+
+zapretUI — [MIT](LICENSE). Внутри используются:
+
+- [zapret2](https://github.com/bol-van/zapret2) (winws2 и скрипты Lua) — MIT;
+- [WinDivert](https://github.com/basil00/WinDivert) — LGPL v3;
+- Cygwin (`cygwin1.dll`) — LGPL v3.

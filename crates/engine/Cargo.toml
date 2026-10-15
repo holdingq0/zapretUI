@@ -1,0 +1,12 @@
+[package]
+name = "rkn-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rkn-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+windows.workspace = true

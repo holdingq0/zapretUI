@@ -1,0 +1,5 @@
+# Where zapretUI looks for updates. Built into zapretUI-svc.exe.
+# repo: GitHub repository "owner/name" whose Releases carry the builds. Empty: updates are off.
+# key: Ed25519 public key (hex) that signs manifest.json of every release; written by `cargo xtask keygen`.
+repo = "holdingq0/zapretUI"
+key = "4c1b57c28f140fb1be17505cefd9e44705b51b79c193380b1350c0a70e07fe82"

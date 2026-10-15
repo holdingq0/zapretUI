@@ -1,0 +1,74 @@
+[family]
+split = 0.3
+disorder = 0.4
+seqovl = 0.55
+disorder_ovl = 0.4
+fake = 0.5
+fake_split = 0.8
+fake_disorder = 0.9
+fakedsplit = 0.75
+fakeddisorder = 0.6
+hostfakesplit = 0.65
+
+[fooling]
+ts = 1.0
+md5 = 0.8
+seq = 0.75
+seqbig = 0.45
+ack = 0.4
+badsum = 0.35
+noack = 0.25
+syn = 0.2
+autottl1 = 0.55
+autottl2 = 0.7
+autottl3 = 0.55
+autottl4 = 0.4
+autottl5 = 0.35
+ttl1 = 0.2
+ttl2 = 0.35
+ttl3 = 0.5
+ttl4 = 0.55
+ttl5 = 0.5
+ttl6 = 0.45
+ttl7 = 0.4
+ttl8 = 0.35
+ttl9 = 0.25
+ttl10 = 0.25
+ttl11 = 0.2
+ttl12 = 0.2
+
+[pos]
+"1" = 0.7
+"2" = 0.6
+"sniext+1" = 0.65
+"sniext+4" = 0.5
+"host+1" = 0.6
+midsld = 0.9
+"1,midsld" = 0.75
+"1,midsld,1220" = 0.5
+"1,sniext+1,host+1,midsld-2,midsld,midsld+2,endhost-1" = 0.45
+"10" = 0.5
+"10,sniext+1" = 0.5
+"10,sniext+4" = 0.45
+"10,midsld" = 0.55
+"method+2" = 0.8
+"method+2,midsld" = 0.7
+
+[repeats]
+"1" = 0.5
+"6" = 0.9
+"11" = 0.7
+
+[blob]
+fake = 1.0
+zeros = 0.45
+
+[mod]
+none = 0.8
+rnd_dupsid = 0.65
+padencap = 0.55
+
+[ovl]
+"1" = 0.5
+pattern = 0.8
+pair = 0.5

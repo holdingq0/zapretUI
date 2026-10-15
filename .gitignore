@@ -1,0 +1,7 @@
+/target/
+/resources/winws2/*
+!/resources/winws2/SHA256SUMS
+!/resources/winws2/VERSION
+*.log
+!/resources/winws2/LICENSE-zapret2.txt
+/PLAN.md

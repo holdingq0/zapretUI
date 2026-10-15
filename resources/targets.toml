@@ -1,0 +1,97 @@
+[[service]]
+name = "YouTube"
+domains = ["youtube.com", "googlevideo.com", "ytimg.com", "ggpht.com", "youtu.be", "youtube-nocookie.com", "youtubei.googleapis.com", "youtubekids.com", "yt.be"]
+probe = ["www.youtube.com"]
+
+[[service]]
+name = "Discord"
+domains = ["discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discord.media", "discordcdn.com", "discord.dev", "discord.new", "discord.gift", "discordstatus.com", "dis.gd"]
+probe = ["discord.com", "gateway.discord.gg"]
+
+[[service]]
+name = "Twitch"
+domains = ["twitch.tv", "ttvnw.net", "jtvnw.net", "twitchcdn.net"]
+probe = ["www.twitch.tv"]
+
+[[service]]
+name = "X"
+domains = ["x.com", "twitter.com", "twimg.com", "t.co"]
+probe = ["x.com"]
+
+[[service]]
+name = "Instagram"
+domains = ["instagram.com", "cdninstagram.com", "ig.me"]
+probe = ["www.instagram.com"]
+
+[[service]]
+name = "Rutracker"
+domains = ["rutracker.org", "rutracker.net", "rutracker.cc", "t-ru.org"]
+probe = ["rutracker.org"]
+probe_http = ["rutracker.org"]
+
+[[service]]
+name = "Cloudflare"
+domains = ["cloudflare.com"]
+probe = ["www.cloudflare.com"]
+
+[[service]]
+name = "SoundCloud"
+domains = ["soundcloud.com", "sndcdn.com"]
+
+[[service]]
+name = "EA app"
+kind = "launcher"
+icon = "ea"
+domains = ["ea.com", "origin.com"]
+probe = ["accounts.ea.com"]
+processes = ["EADesktop.exe"]
+
+[[service]]
+name = "Ubisoft Connect"
+kind = "launcher"
+icon = "ubisoft"
+domains = ["ubisoft.com", "ubi.com", "ubisoftconnect.com"]
+probe = ["connect.ubisoft.com"]
+processes = ["upc.exe"]
+
+[[service]]
+name = "Roblox"
+kind = "game"
+icon = "roblox"
+domains = ["roblox.com", "rbxcdn.com", "rbx.com", "robloxlabs.com"]
+probe = ["www.roblox.com"]
+processes = ["RobloxPlayerBeta.exe"]
+
+[[service]]
+name = "Genshin Impact"
+kind = "game"
+icon = "mihoyo"
+domains = ["hoyoverse.com", "mihoyo.com", "hoyolab.com"]
+probe = ["genshin.hoyoverse.com"]
+processes = ["GenshinImpact.exe"]
+
+[[service]]
+name = "Apex Legends"
+kind = "game"
+icon = "ea"
+launcher = "EA app"
+processes = ["r5apex.exe", "r5apex_dx12.exe"]
+
+[[service]]
+name = "Rainbow Six Siege X"
+kind = "game"
+icon = "ubisoft"
+launcher = "Ubisoft Connect"
+processes = ["RainbowSix.exe", "RainbowSix_Vulkan.exe"]
+
+[[control]]
+name = "Яндекс"
+host = "ya.ru"
+
+[[control]]
+name = "ВКонтакте"
+host = "vk.com"
+
+[[control]]
+name = "Госуслуги"
+host = "www.gosuslugi.ru"

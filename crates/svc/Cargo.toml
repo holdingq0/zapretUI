@@ -1,0 +1,29 @@
+[package]
+name = "rkn-svc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "zapretUI-svc"
+path = "src/main.rs"
+
+[dependencies]
+rkn-core.workspace = true
+rkn-engine.workspace = true
+rkn-probe.workspace = true
+rkn-search.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+interprocess.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+windows = { workspace = true, features = ["Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Networking_NetworkListManager", "Win32_Networking_WinHttp", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_UI_Shell", "Win32_System_TaskScheduler", "Win32_System_Variant", "Win32_System_Ole", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp"] }
+windows-service.workspace = true
+sha2 = "0.11"
+ring = "0.17"
+widestring = "1.2"
