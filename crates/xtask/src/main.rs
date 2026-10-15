@@ -1,8 +1,9 @@
 // Release tooling, run by hand on the developer's machine:
 //   cargo xtask keygen             once: makes the signing key, writes its public half to resources/release.toml
 //   cargo xtask release [--dry-run] [--notes FILE]
-//                                  builds the installer, the portable zip and the signed update file,
-//                                  publishes GitHub release v<version> with these three files via `gh`
+//                                  builds the installer (with the signed program attached, which the
+//                                  updater also uses) and the portable zip, publishes them as GitHub
+//                                  release v<version> via `gh`
 // The private key stays in %USERPROFILE%\.zapretUI\release.key and never enters the repository.
 
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use anyhow::{Context, bail, ensure};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use rkn_core::paths::{APP_EXE, PORTABLE_MARK, PRODUCT, SERVICE_EXE};
-use rkn_core::release::{FileEntry, Manifest, Place, hex, pack, split, unhex, unpack, update_asset};
+use rkn_core::release::{FileEntry, Manifest, Place, attach, attached, hex, pack, setup_asset, split, unhex, unpack};
 use serde::Deserialize;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -103,22 +104,22 @@ fn copy(from: &Path, to: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reads the update back the way the service will: signature against the public key in
-/// release.toml, version, every file against its hash.
-fn check_update(path: &Path, public: &str) -> anyhow::Result<()> {
+/// Reads the installer back the way the installer and the updater will: the attached pack, its
+/// signature against the public key in release.toml, the version, every file against its hash.
+fn check_setup(path: &Path, public: &str) -> anyhow::Result<()> {
     let bytes = std::fs::read(path)?;
-    let (manifest_bytes, signature, body) = unpack(&bytes).context("файл обновления не читается")?;
+    let (manifest_bytes, signature, body) = attached(&bytes).and_then(unpack).context("в установщике нет программы")?;
     let key = unhex(public).context("ключ в release.toml")?;
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
         .verify(manifest_bytes, signature)
-        .map_err(|_| anyhow::anyhow!("подпись файла обновления не сходится с ключом"))?;
+        .map_err(|_| anyhow::anyhow!("подпись в установщике не сходится с ключом"))?;
     let manifest: Manifest = serde_json::from_slice(manifest_bytes)?;
-    ensure!(manifest.version == VERSION, "версия в файле обновления не {VERSION}");
-    let parts = split(&manifest, body).context("размеры файлов в обновлении не сходятся")?;
+    ensure!(manifest.version == VERSION, "версия в установщике не {VERSION}");
+    let parts = split(&manifest, body).context("размеры файлов в установщике не сходятся")?;
     for (entry, data) in manifest.files.iter().zip(parts) {
         ensure!(hex(ring::digest::digest(&ring::digest::SHA256, data).as_ref()) == entry.sha256, "{} не совпадает с хешем", entry.path);
     }
-    println!("Файл обновления проверен: {} файлов, подпись верна", manifest.files.len());
+    println!("Установщик проверен: {} файлов внутри, подпись верна", manifest.files.len());
     Ok(())
 }
 
@@ -170,10 +171,7 @@ fn release(dry_run: bool, notes: Option<PathBuf>) -> anyhow::Result<()> {
         entries.push((entry, from));
     }
 
-    // The installer: one exe with the program inside.
-    run(Command::new("cargo").current_dir(root()).env("ZAPRETUI_PAYLOAD", &program).args(["build", "--release", "-p", "rkn-setup"]))?;
-    let setup = dist.join(format!("{PRODUCT}-setup-{VERSION}.exe"));
-    copy(&built.join(format!("{PRODUCT}-setup.exe")), &setup)?;
+    run(Command::new("cargo").current_dir(root()).args(["build", "--release", "-p", "rkn-setup"]))?;
 
     // The portable copy: the same files, the marker, the license, packed into a zip.
     let name = format!("{PRODUCT}-portable-{VERSION}");
@@ -186,15 +184,16 @@ fn release(dry_run: bool, notes: Option<PathBuf>) -> anyhow::Result<()> {
     let zip = dist.join(format!("{name}.zip"));
     run(Command::new("tar").current_dir(&dist).arg("-a").arg("-c").arg("-f").arg(&zip).arg(&name))?;
 
-    // The update: one file with the signed list of files and the files themselves.
+    // The installer: the program as a signed pack appended to it. The updater downloads the same file.
     let manifest = Manifest { version: VERSION.to_string(), files: entries.iter().map(|(e, _)| e.clone()).collect() };
     let body = serde_json::to_vec(&manifest)?;
     let contents = entries.iter().map(|(_, from)| std::fs::read(from)).collect::<Result<Vec<_>, _>>()?;
-    let update = dist.join(update_asset(VERSION));
-    std::fs::write(&update, pack(&body, pair.sign(&body).as_ref(), &contents))?;
-    check_update(&update, &source.key)?;
+    let pack = pack(&body, pair.sign(&body).as_ref(), &contents);
+    let setup = dist.join(setup_asset(VERSION));
+    std::fs::write(&setup, attach(&std::fs::read(built.join(format!("{PRODUCT}-setup.exe")))?, &pack))?;
+    check_setup(&setup, &source.key)?;
 
-    let files: Vec<PathBuf> = vec![setup, zip, update];
+    let files: Vec<PathBuf> = vec![setup, zip];
     println!("Готово: {}", dist.display());
     if dry_run {
         println!("--dry-run: релиз {tag} не опубликован");

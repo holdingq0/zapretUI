@@ -1,17 +1,38 @@
-// How a GitHub release carries an update: one file, zapretUI-update-<version>.bin, next to the
-// installer and the portable zip. Inside: the manifest (version, every file with its size and
-// sha256), an Ed25519 signature of the manifest made with the key whose public half is built into
-// zapretUI-svc.exe, then the files themselves in manifest order.
+// A release has two files: the installer and the portable zip. The installer carries the program
+// as a signed pack appended to its end, and the updater downloads the same installer to take the
+// pack from it. The pack: the manifest (version, every file with its size and sha256), an Ed25519
+// signature of the manifest made with the key whose public half is built into the program, then
+// the files in manifest order.
 //
-//   "ZUIUPD01" | manifest length (u32 LE) | manifest JSON | signature (64 bytes) | files
+//   pack:    "ZUIUPD01" | manifest length (u32 LE) | manifest JSON | signature (64 bytes) | files
+//   trailer: installer exe | pack | pack offset (u64 LE) | "ZUITAIL1"
 
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 8] = b"ZUIUPD01";
+const TAIL: &[u8; 8] = b"ZUITAIL1";
 pub const SIGNATURE_LEN: usize = 64;
 
-pub fn update_asset(version: &str) -> String {
-    format!("zapretUI-update-{version}.bin")
+pub fn setup_asset(version: &str) -> String {
+    format!("zapretUI-setup-{version}.exe")
+}
+
+/// The installer with the pack appended; Windows ignores data past the end of an exe image.
+pub fn attach(exe: &[u8], pack: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(exe.len() + pack.len() + 16);
+    out.extend_from_slice(exe);
+    out.extend_from_slice(pack);
+    out.extend_from_slice(&(exe.len() as u64).to_le_bytes());
+    out.extend_from_slice(TAIL);
+    out
+}
+
+/// The pack appended to an installer, if there is one.
+pub fn attached(bytes: &[u8]) -> Option<&[u8]> {
+    let body = bytes.strip_suffix(TAIL.as_slice())?;
+    let at = body.len().checked_sub(8)?;
+    let offset = usize::try_from(u64::from_le_bytes(body[at..].try_into().ok()?)).ok()?;
+    body.get(offset..at)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

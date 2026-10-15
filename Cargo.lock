@@ -376,7 +376,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "embed-resource",
+ "ring",
  "rkn-core",
+ "serde",
+ "serde_json",
+ "toml",
  "windows",
 ]
 

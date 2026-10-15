@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, ensure};
 use rkn_core::ipc::{Level, UpdateState};
 use rkn_core::paths;
-use rkn_core::release::{FileEntry, Manifest, Place, split, unhex, unpack, update_asset};
+use rkn_core::release::{FileEntry, Manifest, Place, attached, setup_asset, split, unhex, unpack};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -205,9 +205,10 @@ fn latest(repo: &str) -> anyhow::Result<Option<Release>> {
 
 /// Downloads and checks everything the release changes; returns the files to put in place.
 fn download(release: &Release, key: &[u8]) -> anyhow::Result<Vec<(FileEntry, PathBuf)>> {
-    let asset = release.asset(&update_asset(release.version()))?;
+    // The new version comes inside its installer.
+    let asset = release.asset(&setup_asset(release.version()))?;
     let bytes = get(&asset.browser_download_url, "application/octet-stream", MAX_UPDATE)?;
-    let (manifest_bytes, signature, body) = unpack(&bytes).context("файл обновления повреждён")?;
+    let (manifest_bytes, signature, body) = attached(&bytes).and_then(unpack).context("установщик новой версии повреждён")?;
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
         .verify(manifest_bytes, signature)
         .map_err(|_| anyhow!("подпись обновления не совпадает, обновление отклонено"))?;

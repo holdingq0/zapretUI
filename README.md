@@ -27,7 +27,7 @@ cargo build --release -p rkn-svc -p rkn-app
 
 1. Один раз: `cargo xtask keygen`. Закрытый ключ ляжет в `%USERPROFILE%\.zapretUI\release.key`, сохраните его копию.
 2. Поднимите `version` в `Cargo.toml`.
-3. `cargo xtask release --notes notes.md` соберёт установщик, портативный zip и файлы обновления и опубликует релиз через `gh`. С `--dry-run` всё соберётся в `target/dist` без публикации.
+3. `cargo xtask release --notes notes.md` соберёт установщик и портативный zip и опубликует релиз через `gh`. Программа внутри установщика подписана, автообновление берёт новую версию из него же. С `--dry-run` всё соберётся в `target/dist` без публикации.
 
 ## Лицензии
 
