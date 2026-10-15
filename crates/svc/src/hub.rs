@@ -263,7 +263,11 @@ impl Hub {
                 procs: BTreeSet::new(),
                 has_probed: false,
                 has_direct: false,
-                update: Update::default(),
+                // Not "off" for the first moments of a fresh start: the window would say updates are disabled.
+                update: Update {
+                    state: if update::enabled() { UpdateState::Idle } else { UpdateState::Off },
+                    ..Update::default()
+                },
                 updating: false,
             }),
             tx,

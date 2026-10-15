@@ -40,9 +40,14 @@ pub fn legacy_data_dir() -> PathBuf {
 
 /// Program Files: users may read and run, only administrators and the service may write.
 pub fn install_dir() -> PathBuf {
-    if let Some(root) = portable_root() {
-        return root.to_path_buf();
+    match portable_root() {
+        Some(root) => root.to_path_buf(),
+        None => installed_dir(),
     }
+}
+
+/// Where the installer puts the program, even when asked from a portable copy.
+pub fn installed_dir() -> PathBuf {
     std::env::var_os("ProgramW6432")
         .or_else(|| std::env::var_os("ProgramFiles"))
         .map(PathBuf::from)

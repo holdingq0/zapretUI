@@ -130,11 +130,26 @@ fn app_icon(metric: SYSTEM_METRICS_INDEX) -> HICON {
 }
 
 /// Starts the installed copy to take over from this one, then quits; the new copy waits for our mutex.
+/// The window that belongs to the service answering now: this copy's own, or the installed one
+/// when a portable copy found the installed service already running.
+fn window_of(service_portable: bool) -> std::path::PathBuf {
+    if paths::portable() && !service_portable {
+        paths::installed_dir().join(paths::APP_EXE)
+    } else {
+        paths::app_exe()
+    }
+}
+
 fn hand_over(tray: bool, updated: bool) {
     if with(|app| std::mem::replace(&mut app.leaving, true)).unwrap_or(true) {
         return;
     }
-    let mut cmd = std::process::Command::new(paths::app_exe());
+    let service_portable = with(|app| {
+        let shared = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        shared.status.as_ref().is_none_or(|s| s.portable)
+    })
+    .unwrap_or(true);
+    let mut cmd = std::process::Command::new(window_of(service_portable));
     cmd.arg("--replace");
     if updated {
         cmd.arg("--updated");
@@ -444,18 +459,24 @@ fn refresh_theme(app: &mut App) {
 }
 
 fn on_update(app: &mut App) {
-    let (look, version) = {
+    let (look, service) = {
         let shared = app.store.lock().unwrap_or_else(|e| e.into_inner());
-        let version = shared.status.as_ref().filter(|_| shared.connected).map(|s| s.version.clone());
-        (tray::look(&shared), version)
+        let service = shared.status.as_ref().filter(|_| shared.connected).map(|s| (s.version.clone(), s.portable));
+        (tray::look(&shared), service)
     };
-    // The service updated itself and the app next to it: hand over to the new copy, once.
-    if let Some(version) = &version {
+    let version = service.as_ref().map(|(v, _)| v.clone());
+    if let Some((version, service_portable)) = &service {
+        let target = window_of(*service_portable);
         let fresh = std::env::args().any(|a| a == "--updated");
-        if paths::newer(version, env!("CARGO_PKG_VERSION")) && !fresh && paths::app_exe().is_file() {
+        // The service updated itself and the window next to it: hand over to the new copy, once.
+        let updated = paths::newer(version, env!("CARGO_PKG_VERSION")) && !fresh;
+        // A portable copy started while the installed program runs: both are one service, and the
+        // installed window is the one that matches it and gets its updates.
+        let foreign = paths::portable() && !service_portable;
+        if (updated || foreign) && target.is_file() {
             let tray = app.main.is_none();
             unsafe {
-                let _ = PostMessageW(Some(app.tray_hwnd), WM_HANDOVER, WPARAM(tray as usize), LPARAM(1));
+                let _ = PostMessageW(Some(app.tray_hwnd), WM_HANDOVER, WPARAM(tray as usize), LPARAM(updated as isize));
             }
         }
     }
