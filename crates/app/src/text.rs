@@ -26,7 +26,7 @@ pub fn phase(phase: Phase) -> &'static str {
         Phase::Round1 => "Пробую способы обхода",
         Phase::Round2 => "Проверяю лучшие на всех сервисах",
         Phase::Done => "Готово, запомнил для этой сети",
-        Phase::Failed => "Подбор остановлен",
+        Phase::Failed => "Настройка остановлена",
     }
 }
 
@@ -36,23 +36,30 @@ pub struct View {
     pub action: Option<&'static str>,
 }
 
-pub fn view(connected: bool, missing: bool, status: Option<&Status>) -> View {
+pub fn view(connected: bool, missing: bool, stopped: bool, status: Option<&Status>) -> View {
     let v = |title: &str, sub: String, action: Option<&'static str>| View { title: title.into(), sub, action };
     if missing && rkn_core::paths::portable() {
-        return v("Запуск", "Нужны права администратора: подтвердите запрос Windows".into(), Some("Запустить"));
+        return v("Не запущено", "Нужны права администратора: подтвердите запрос Windows".into(), Some("Запустить"));
     }
     if missing {
         return v("Не установлено", "Служба zapretUI работает в фоне и обходит блокировки. Права администратора нужны один раз".into(), Some("Установить"));
     }
     let Some(status) = status.filter(|_| connected) else {
-        return v("Нет связи", "Служба zapretUI не запущена. Перезагрузите компьютер".into(), None);
+        return match stopped {
+            true => v("Нет связи", "Служба zapretUI остановлена. Запустите её снова".into(), Some("Запустить")),
+            false => v("Нет связи", "Жду ответа службы zapretUI".into(), None),
+        };
     };
     let message = || status.message.clone();
     match status.state {
         State::Working => {
-            let n = status.sites.iter().filter(|s| s.kind == rkn_core::ipc::Kind::Site && s.state == SiteState::Bypassed).count();
+            // Games without their own domains share their launcher's row and are not counted twice.
+            let own = |s: &&SiteStatus| !s.id.starts_with("game:");
+            let n = status.sites.iter().filter(own).filter(|s| s.state == SiteState::Bypassed).count();
             let sub = if n > 0 {
                 format!("Через обход {} {n} {}", plural(n, "идёт", "идут", "идут"), plural(n, "сервис", "сервиса", "сервисов"))
+            } else if status.sites.iter().any(|s| s.state == SiteState::Checking) {
+                "Проверяю, что режет провайдер".into()
             } else {
                 "Провайдер пока ничего не режет".into()
             };

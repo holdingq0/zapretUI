@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use rkn_core::paths;
-use rkn_core::recipe::Recipe;
+use rkn_core::recipe::{Action, Blob, Payload, Recipe};
 use rkn_core::reserve::Reserve;
 use rkn_core::sites::{SiteMode, Sites};
 use rkn_engine::{Filter, Plan, Profile, Proto, lua_files, port_exclude_filter};
@@ -65,7 +65,23 @@ fn from_engine_dir(path: PathBuf) -> PathBuf {
 
 pub const VOICE_PORTS: &str = "19294-19344,50000-50100";
 
-pub fn build_plan(sites: &Sites, reserve: &Reserve, probed: bool, direct: bool) -> Option<Plan> {
+/// Voice traffic has no host name and cannot be probed without an account, so it gets the
+/// strategy that works on Russian DPI almost everywhere: a burst of zero-filled fakes before
+/// the IP discovery and STUN packets that open a call.
+pub fn default_voice() -> Vec<Recipe> {
+    vec![Recipe {
+        payload: Payload::Voice,
+        actions: vec![Action::Fake { blob: Blob::Hex("00".repeat(64)), fooling: vec![], repeats: 6, tls_mod: vec![] }],
+    }]
+}
+
+/// `voice`: Discord is blocked on this network, so its calls are blocked too.
+pub fn build_plan(sites: &Sites, reserve: &Reserve, probed: bool, direct: bool, voice: bool) -> Option<Plan> {
+    let voice_recipes = match (&reserve.voice, voice) {
+        (own, _) if !own.is_empty() => own.clone(),
+        (_, true) => default_voice(),
+        _ => Vec::new(),
+    };
     let has = |mode: SiteMode| sites.modes.values().any(|m| *m == mode);
     let host_filter = |ports: &str, l7: &[&str]| {
         let mut filter = Filter {
@@ -101,7 +117,7 @@ pub fn build_plan(sites: &Sites, reserve: &Reserve, probed: bool, direct: bool) 
                 l7: vec!["discord".into(), "stun".into()],
                 ..Filter::default()
             },
-            &reserve.voice,
+            &voice_recipes,
         ),
     ];
 

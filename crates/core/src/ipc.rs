@@ -85,9 +85,6 @@ pub struct SiteStatus {
     pub running: bool,
     #[serde(default)]
     pub via: bool,
-    /// Found by the bypass itself, not part of the catalog.
-    #[serde(default)]
-    pub found: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

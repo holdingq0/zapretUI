@@ -29,13 +29,22 @@ fn place(from: &Path, to: &Path) -> anyhow::Result<()> {
     if let Some(dir) = to.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    let mut moved = None;
     if to.exists() && std::fs::remove_file(to).is_err() {
         let mut old = to.as_os_str().to_owned();
         old.push(".old");
+        let old = PathBuf::from(old);
         let _ = std::fs::remove_file(&old);
         std::fs::rename(to, &old).with_context(|| format!("{} занят", to.display()))?;
+        moved = Some(old);
     }
-    std::fs::copy(from, to).with_context(|| format!("копирование {}", to.display()))?;
+    if let Err(e) = std::fs::copy(from, to) {
+        // The running copy goes back: a failed install must not leave the service without its exe.
+        if let Some(old) = moved {
+            let _ = std::fs::rename(old, to);
+        }
+        return Err(e).with_context(|| format!("копирование {}", to.display()));
+    }
     Ok(())
 }
 
@@ -127,12 +136,23 @@ pub fn install() -> anyhow::Result<()> {
     if let Some(service) = &existing {
         stop(service)?;
     }
-    migrate(&manager)?;
-
-    acl::secure(&paths::data_dir()).context("права на папку данных")?;
-    copy_engine(&src)?;
-    engine::verify(&paths::engine_dir()).context("установленные файлы winws2")?;
-    let exe = copy_binaries(&exe)?;
+    let prepared = (|| {
+        migrate(&manager)?;
+        acl::secure(&paths::data_dir()).context("права на папку данных")?;
+        copy_engine(&src)?;
+        engine::verify(&paths::engine_dir()).context("установленные файлы winws2")?;
+        copy_binaries(&exe)
+    })();
+    let exe = match prepared {
+        Ok(exe) => exe,
+        Err(e) => {
+            // An antivirus holding a file, say: the version that was there keeps working.
+            if let Some(service) = &existing {
+                let _ = service.start::<&str>(&[]);
+            }
+            return Err(e);
+        }
+    };
 
     let info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -168,19 +188,37 @@ pub fn install() -> anyhow::Result<()> {
     if let Err(e) = system::add_shortcut() {
         println!("Ярлык в меню «Пуск» не создан: {e:#}");
     }
-    system::add_uninstall_entry().context("запись в списке программ")?;
+    if let Err(e) = system::add_uninstall_entry() {
+        println!("Запись в списке программ не создана: {e:#}");
+    }
     println!("Служба {SERVICE_NAME} установлена и запущена. Программа: {}", paths::install_dir().display());
     Ok(())
 }
 
-/// Run by the service itself after an update: stops it, waits, starts the new binary.
+/// The service is installed but stopped (it gave up after crashes, or someone stopped it): the
+/// window's button starts it, through UAC because users may not start services.
+pub fn start() -> anyhow::Result<()> {
+    if !system::is_admin() {
+        return system::elevate(&["start".into()]);
+    }
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::START)?;
+    if service.query_status()?.current_state == ServiceState::Stopped {
+        service.start::<&str>(&[])?;
+    }
+    Ok(())
+}
+
 /// Run by the service itself after an update: stops it and starts the new binary. If the new
 /// service does not stay up, the files the update moved aside come back and the old one starts.
 pub fn restart() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START)?;
     std::thread::sleep(Duration::from_millis(500));
-    stop(&service)?;
+    // A slow stop must not leave the service off: give it one more wait, then start regardless.
+    if stop(&service).is_err() {
+        let _ = wait_stopped(&service);
+    }
     if service.start::<&str>(&[]).is_ok() && stays_up(&service) {
         return Ok(());
     }

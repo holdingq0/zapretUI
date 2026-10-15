@@ -116,7 +116,13 @@ pub fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<(
     }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
-    std::fs::write(&tmp, contents)?;
+    // Flushed before the rename: a power cut must not leave an empty config or network memory.
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
     std::fs::rename(tmp, path)
 }
 

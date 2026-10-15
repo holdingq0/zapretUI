@@ -75,6 +75,8 @@ struct App {
     theme: Theme,
     config: Option<Config>,
     autostart: bool,
+    /// A GetConfig is on its way; not asked again until it answers.
+    config_asked: bool,
     taskbar_created: u32,
     /// A newer copy is taking over; ignore further triggers until we are gone.
     leaving: bool,
@@ -188,6 +190,12 @@ fn reply(tray: HWND, tag: Tag, result: anyhow::Result<Message>) {
     }
 }
 
+/// Elevated `zapretUI-svc.exe start`: the service is installed but stopped.
+fn start_service(tray: HWND) {
+    let target = tray.0 as isize;
+    std::thread::spawn(move || reply(HWND(target as *mut _), Tag::Plain, admin::run_svc("start", true).map(|_| Message::Ok)));
+}
+
 /// Elevated `zapretUI-svc.exe install` from the folder this copy runs in.
 fn install(tray: HWND) {
     let target = tray.0 as isize;
@@ -245,7 +253,9 @@ fn main() {
             return;
         }
     }
-    autostart::migrate();
+    if !paths::portable() {
+        autostart::migrate();
+    }
     dark_menus();
 
     let hinstance = unsafe { GetModuleHandleW(None).unwrap_or_default() };
@@ -281,6 +291,7 @@ fn main() {
             theme: theme::current(),
             config: None,
             autostart: autostart::enabled(),
+            config_asked: false,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             leaving: false,
         })
@@ -357,6 +368,13 @@ fn open_main() {
         };
         // Re-run WM_NCCALCSIZE now that our handler is in place, so the system frame disappears.
         let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        // The system DPI is the one from sign-in; the monitor may have been rescaled since.
+        let real = GetDpiForWindow(hwnd);
+        if real != dpi && real != 0 {
+            let (w2, h2) = ((ui::W * real as f32 / 96.0).round() as i32, (ui::H * real as f32 / 96.0).round() as i32);
+            let (x2, y2) = (area.left + (area.right - area.left - w2) / 2, area.top + (area.bottom - area.top - h2) / 2);
+            let _ = SetWindowPos(hwnd, None, x2, y2, w2, h2, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         let corner = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, (&corner as *const DWM_WINDOW_CORNER_PREFERENCE).cast(), size_of_val(&corner) as u32);
         let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: 1, cxRightWidth: 1, cyTopHeight: 1, cyBottomHeight: 1 });
@@ -385,7 +403,13 @@ fn close_main() {
 /// "Выход": a portable copy also stops its service, an installed one leaves the service running.
 fn exit() {
     if paths::portable() {
-        let _ = pipe::request(&Request::Shutdown);
+        // A busy service must not freeze the tray: it also stops by itself a few seconds after the window is gone.
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = pipe::request(&Request::Shutdown);
+            let _ = done.send(());
+        });
+        let _ = wait.recv_timeout(std::time::Duration::from_millis(1500));
     }
     quit();
 }
@@ -426,9 +450,9 @@ fn on_update(app: &mut App) {
         (tray::look(&shared), version)
     };
     // The service updated itself and the app next to it: hand over to the new copy, once.
-    if let Some(version) = version {
+    if let Some(version) = &version {
         let fresh = std::env::args().any(|a| a == "--updated");
-        if paths::newer(&version, env!("CARGO_PKG_VERSION")) && !fresh && paths::app_exe().is_file() {
+        if paths::newer(version, env!("CARGO_PKG_VERSION")) && !fresh && paths::app_exe().is_file() {
             let tray = app.main.is_none();
             unsafe {
                 let _ = PostMessageW(Some(app.tray_hwnd), WM_HANDOVER, WPARAM(tray as usize), LPARAM(1));
@@ -436,6 +460,11 @@ fn on_update(app: &mut App) {
         }
     }
     app.tray.update(look);
+    // Settings opened while the service was starting: the config request failed then, ask again now.
+    if app.config.is_none() && !app.config_asked && version.is_some() && app.main.as_ref().is_some_and(|m| m.ui.screen == Screen::Settings) {
+        app.config_asked = true;
+        send(app.tray_hwnd, Tag::Config, Request::GetConfig);
+    }
     if let Some(main) = &mut app.main {
         invalidate(main);
     }
@@ -450,6 +479,9 @@ fn on_reply(app: &mut App, reply: Reply) {
     let installed = matches!(reply.tag, Tag::Installed) && problem.is_none();
     if matches!(reply.tag, Tag::Autostart) {
         app.autostart = autostart::enabled();
+    }
+    if matches!(reply.tag, Tag::Config) {
+        app.config_asked = false;
     }
     match (reply.tag, reply.result) {
         (Tag::Config, Ok(Message::Config(config))) => app.config = Some(config),
@@ -484,6 +516,7 @@ fn act(app: &mut App, act: Act) -> Option<Act> {
         Act::Relearn => send(tray, Tag::Plain, Request::Relearn),
         Act::StopLearning => send(tray, Tag::Plain, Request::StopLearning),
         Act::Install if paths::portable() => launch_portable(tray),
+        Act::Install if app.store.lock().unwrap_or_else(|e| e.into_inner()).installed == Some(true) => start_service(tray),
         Act::Install => install(tray),
         Act::CheckUpdate => send(tray, Tag::Plain, Request::CheckUpdate),
         Act::InstallUpdate => send(tray, Tag::Plain, Request::InstallUpdate),
@@ -491,15 +524,10 @@ fn act(app: &mut App, act: Act) -> Option<Act> {
             app.autostart = autostart::enabled();
             send(tray, Tag::Config, Request::GetConfig);
         }
-        Act::Toggle(i) => {
+        Act::Toggle(0) => toggle_autostart(tray, !app.autostart),
+        Act::Toggle(_) => {
             let mut config = app.config.clone()?;
-            match i {
-                0 => {
-                    toggle_autostart(tray, !app.autostart);
-                    return None;
-                }
-                _ => config.auto_update = !config.auto_update,
-            }
+            config.auto_update = !config.auto_update;
             app.config = Some(config.clone());
             send(tray, Tag::Saved, Request::SetConfig { config });
         }
@@ -526,6 +554,7 @@ fn paint(app: &mut App) {
     let Some(main) = main else { return };
     let shared = store.lock().unwrap_or_else(|e| e.into_inner());
     main.ui.missing = !shared.connected && (paths::portable() || shared.installed == Some(false));
+    main.ui.stopped = !shared.connected && !paths::portable() && shared.installed == Some(true);
     main.ui.sync(shared.connected, shared.status.as_ref(), config.as_ref(), *autostart);
     if main.canvas.is_none() {
         let mut r = RECT::default();
@@ -649,12 +678,13 @@ fn menu(hwnd: HWND) {
         add(MF_SEPARATOR, None, "");
         add(MF_STRING | MF_DEFAULT, Some(Item::Open), "Открыть");
         add(on(connected), Some(Item::Power), if paused { "Включить обход" } else { "Выключить обход" });
-        add(on(connected && !paused), Some(Item::Learn), if learning { "Остановить подбор" } else { "Подобрать заново" });
+        add(on(connected && !paused), Some(Item::Learn), if learning { "Остановить настройку" } else { "Настроить заново" });
         add(MF_SEPARATOR, None, "");
         let (text, usable) = match update.state {
             UpdateState::Available => (format!("Обновить до {}", update.version.clone().unwrap_or_default()), true),
             UpdateState::Checking => ("Проверяю обновления…".to_string(), false),
-            UpdateState::Downloading | UpdateState::Installing => ("Устанавливаю обновление…".to_string(), false),
+            UpdateState::Downloading => ("Скачиваю обновление…".to_string(), false),
+            UpdateState::Installing => ("Устанавливаю обновление…".to_string(), false),
             UpdateState::Off => ("Обновления выключены в этой сборке".to_string(), false),
             _ => ("Проверить обновления".to_string(), true),
         };
@@ -769,16 +799,22 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
+                let (px, py) = xy(lparam);
                 with(|app| {
                     if let Some(main) = &mut app.main {
+                        let scale = main.dpi as f32 / 96.0;
+                        main.ui.hover = main.ui.hit(px as f32 / scale, py as f32 / scale);
                         main.ui.press = main.ui.hover;
                     }
                 });
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
+                let (px, py) = xy(lparam);
                 let next = with(|app| {
                     let main = app.main.as_mut()?;
+                    let scale = main.dpi as f32 / 96.0;
+                    main.ui.hover = main.ui.hit(px as f32 / scale, py as f32 / scale);
                     let (hover, press) = (main.ui.hover, main.ui.press.take());
                     let hit = hover.filter(|h| Some(*h) == press)?;
                     let shared = app.store.lock().unwrap_or_else(|e| e.into_inner());

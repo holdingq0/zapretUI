@@ -94,7 +94,8 @@ fn follow(store: &Store, changed: &impl Fn()) -> anyhow::Result<()> {
         if reader.read_line(&mut line)? == 0 {
             return Ok(());
         }
-        let message: Message = serde_json::from_str(&line)?;
+        // A newer service may send something this copy does not know yet: skip it, keep following.
+        let Ok(message) = serde_json::from_str::<Message>(&line) else { continue };
         {
             if let Message::Status(status) = message {
                 store.lock().unwrap_or_else(|e| e.into_inner()).status = Some(*status);

@@ -40,6 +40,22 @@ impl NetMemory {
     }
 }
 
+/// Forgets networks not seen for a year (a café, a friend's Wi-Fi): one file per network otherwise
+/// piles up forever. The current network is always kept.
+pub fn prune(keep: &str, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(paths::network_file(keep).parent().unwrap_or(std::path::Path::new("."))) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let current = path.file_stem().is_some_and(|s| s == keep);
+        let stale = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > max_age);
+        if !current && stale && path.extension().is_some_and(|e| e == "toml") {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

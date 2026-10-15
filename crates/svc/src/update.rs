@@ -253,7 +253,13 @@ fn put_in_place(files: &[(FileEntry, PathBuf)]) -> anyhow::Result<()> {
             }
             let backup = to.exists().then(|| backup_of(&to));
             if let Some(backup) = &backup {
-                let _ = std::fs::remove_file(backup);
+                // A backup from the last update that something still holds open: rename it away,
+                // the cleanup removes ".bad" files later.
+                if backup.exists() && std::fs::remove_file(backup).is_err() {
+                    let mut stale = backup.as_os_str().to_owned();
+                    stale.push(format!(".{}.bad", rkn_core::memory::now()));
+                    let _ = std::fs::rename(backup, PathBuf::from(stale));
+                }
                 std::fs::rename(&to, backup).with_context(|| format!("{} занят", to.display()))?;
             }
             done.push((to.clone(), backup));
@@ -298,11 +304,12 @@ fn skipped() -> PathBuf {
     paths::data_dir().join("rolled-back.txt")
 }
 
-/// The new service did not start: every file moved aside goes back in place.
+/// The new service did not start: every file moved aside goes back in place. Runs in the new
+/// binary (the restart helper), whose own version is the one that failed: the marker naming it is
+/// gone by now if the new service got as far as starting.
 pub fn roll_back() {
-    if let Ok(version) = std::fs::read_to_string(marker()) {
-        let _ = std::fs::write(skipped(), version.trim());
-    }
+    let version = std::fs::read_to_string(marker()).map(|v| v.trim().to_string()).unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into());
+    let _ = std::fs::write(skipped(), version);
     for old in leftovers("old") {
         let current = old.with_extension("");
         let mut broken = current.as_os_str().to_owned();
@@ -317,16 +324,43 @@ pub fn roll_back() {
     let _ = std::fs::remove_file(marker());
 }
 
-/// The installed service restarts through a helper that can roll back; a portable copy starts its
-/// successor, which waits for this process to exit, and then quits.
+/// Both restart through a helper of the new version that can roll back: the installed service
+/// through the service manager, a portable copy by starting its successor once this process is gone.
 fn restart_service() -> anyhow::Result<()> {
     let mut cmd = std::process::Command::new(paths::service_exe());
     if paths::portable() {
-        cmd.arg("portable").arg("--after").arg(std::process::id().to_string());
+        cmd.arg("portable-restart").arg("--after").arg(std::process::id().to_string());
     } else {
         cmd.arg("restart");
     }
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).spawn().context("перезапуск службы")?;
+    Ok(())
+}
+
+/// The portable helper: waits for the old copy to exit, starts the new one and watches it for ten
+/// seconds. A copy that dies in that time is rolled back and the old version starts again.
+pub fn portable_restart(after: Option<u32>) -> anyhow::Result<()> {
+    anyhow::ensure!(paths::portable(), "команда только для портативной копии");
+    if let Some(pid) = after {
+        crate::service::wait_exit(pid);
+    }
+    let start = || {
+        std::process::Command::new(paths::service_exe())
+            .arg("portable")
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .context("запуск новой версии")
+    };
+    let mut child = start()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            roll_back();
+            start()?;
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
     Ok(())
 }
 
@@ -375,7 +409,9 @@ async fn install(hub: &Hub, release: Release, key: Vec<u8>) {
     let applied = blocking(move || {
         put_in_place(&files)?;
         let _ = std::fs::write(marker(), &done);
-        restart_service()
+        // Without a restart the new files would sit under the old running service, which refuses
+        // the engine files it does not know: put the old ones back.
+        restart_service().inspect_err(|_| roll_back())
     })
     .await;
     match applied {

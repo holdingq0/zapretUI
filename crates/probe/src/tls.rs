@@ -28,6 +28,12 @@ fn config() -> io::Result<Arc<ClientConfig>> {
         .ok_or_else(|| io::Error::other("TLS не инициализирован"))
 }
 
+pub fn bad_certificate(e: &io::Error) -> bool {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .is_some_and(|e| matches!(e, rustls::Error::InvalidCertificate(_)))
+}
+
 pub async fn handshake(tcp: TcpStream, host: &str, limit: Duration) -> io::Result<TlsStream<TcpStream>> {
     let name = ServerName::try_from(host.to_owned()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let connector = TlsConnector::from(config()?);

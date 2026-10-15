@@ -40,16 +40,17 @@ pub struct Look {
 pub fn look(shared: &Shared) -> Look {
     let light = crate::autostart::light_taskbar();
     let Some(status) = shared.status.as_ref().filter(|_| shared.connected) else {
-        return Look { dot: Some(MUTE), dim: true, label: "служба не отвечает", light };
+        let label = if shared.installed == Some(false) { "не установлено" } else { "нет связи со службой" };
+        return Look { dot: Some(MUTE), dim: true, label, light };
     };
     let (dot, label) = match status.state {
-        State::Working => (Some(OK), "обход работает"),
-        State::Paused => (Some(MUTE), "обход на паузе"),
+        State::Working => (Some(OK), "обход включён"),
+        State::Paused => (Some(MUTE), "обход выключен"),
         State::Starting => (None, "запуск"),
-        State::Learning => (None, "подбираю способ обхода"),
+        State::Learning => (None, "настраиваю обход"),
         State::Tuning => (None, "нужна настройка"),
         State::Whitelist => (Some(BAD), "белый список оператора"),
-        State::EngineMissing | State::Failed => (Some(BAD), "проблема с движком"),
+        State::EngineMissing | State::Failed => (Some(BAD), "ошибка, откройте окно"),
     };
     Look { dot, dim: false, label, light }
 }

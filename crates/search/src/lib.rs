@@ -84,12 +84,16 @@ pub struct Hit {
     pub target: Target,
     pub ip: IpAddr,
     pub verdict: Verdict,
+    /// A catalog service, not a site the engine found by itself: the first round tests on these.
+    pub core: bool,
 }
 
 pub struct Job {
     pub class: Class,
     pub hits: Vec<Hit>,
     pub engine_dir: PathBuf,
+    /// Strategies that worked on this network before, tried in the first batch.
+    pub seed: Vec<Recipe>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -300,19 +304,39 @@ async fn run_batch(
     Ok(scores)
 }
 
+/// Up to three sites with different kinds of blocking, catalog services first: a flaky site the
+/// engine found by itself must not fail every candidate in the first round.
 fn round1_hits(hits: &[Hit]) -> Vec<Hit> {
+    let mut ordered: Vec<&Hit> = hits.iter().filter(|h| h.core).collect();
+    ordered.extend(hits.iter().filter(|h| !h.core));
     let mut picked: Vec<Hit> = Vec::new();
-    for hit in hits {
+    for hit in &ordered {
         if picked.len() < ROUND1_HITS && !picked.iter().any(|p| p.verdict == hit.verdict) {
-            picked.push(hit.clone());
+            picked.push((*hit).clone());
         }
     }
-    for hit in hits {
+    for hit in &ordered {
         if picked.len() < ROUND1_HITS && !picked.iter().any(|p| p.target == hit.target) {
-            picked.push(hit.clone());
+            picked.push((*hit).clone());
         }
     }
     picked
+}
+
+/// Puts the old strategies at the head of the pool, in their old order of preference.
+fn seed(pool: &mut Vec<Candidate>, seeds: &[Recipe]) {
+    for (i, recipe) in seeds.iter().enumerate() {
+        let prior = 1000.0 - i as f64;
+        match pool.iter_mut().find(|c| &c.recipe == recipe) {
+            Some(known) => known.prior = prior,
+            None => pool.push(Candidate {
+                recipe: recipe.clone(),
+                features: vec![("family", "seed".into())],
+                group: format!("seed:{i}"),
+                prior,
+            }),
+        }
+    }
 }
 
 fn hosts_of(hits: &[Hit], indices: impl Iterator<Item = usize>) -> Vec<String> {
@@ -328,6 +352,7 @@ pub async fn search(job: &Job, progress: &(dyn Fn(View) + Send + Sync)) -> anyho
     }
     let started = Instant::now();
     let mut pool = candidates(job.class, &Priors::builtin());
+    seed(&mut pool, &job.seed);
     let total = pool.len();
     let mut stats = Stats::default();
     let first = Arc::new(round1_hits(&job.hits));
@@ -404,7 +429,8 @@ pub async fn search(job: &Job, progress: &(dyn Fn(View) + Send + Sync)) -> anyho
     board.phase = Phase::Round2;
     board.percent = 0.75;
 
-    let all: Arc<Vec<Hit>> = Arc::new(job.hits.iter().take(ROUND2_HITS).cloned().collect());
+    let all: Arc<Vec<Hit>> =
+        Arc::new(job.hits.iter().filter(|h| h.core).chain(job.hits.iter().filter(|h| !h.core)).take(ROUND2_HITS).cloned().collect());
     board.say(
         LineKind::Stage,
         "Этап 2",
@@ -476,11 +502,8 @@ pub async fn search(job: &Job, progress: &(dyn Fn(View) + Send + Sync)) -> anyho
         None => board.say(LineKind::Problem, "Итог", "Лучшие варианты не прошли повторную проверку".into()),
     }
 
-    let fixed = hosts_of(&job.hits, (0..all.len()).filter(|i| covered[*i]));
-    let unfixed = hosts_of(&job.hits, (0..job.hits.len()).filter(|i| *i >= all.len() || !covered[*i]))
-        .into_iter()
-        .filter(|h| !fixed.contains(h))
-        .collect();
+    let fixed = hosts_of(&all, (0..all.len()).filter(|i| covered[*i]));
+    let unfixed = hosts_of(&job.hits, 0..job.hits.len()).into_iter().filter(|h| !fixed.contains(h)).collect();
     let recipes = chosen.into_iter().map(|i| recipes[ranked[i].0].clone()).collect();
     Ok(Found { recipes, fixed, unfixed, tried })
 }

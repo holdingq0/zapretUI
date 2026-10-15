@@ -279,6 +279,8 @@ pub enum Payload {
     TlsClientHello,
     HttpReq,
     QuicInitial,
+    /// Discord voice: the IP discovery packet and STUN that open a call.
+    Voice,
     Known,
     All,
 }
@@ -289,6 +291,7 @@ impl Payload {
             Self::TlsClientHello => "tls_client_hello",
             Self::HttpReq => "http_req",
             Self::QuicInitial => "quic_initial",
+            Self::Voice => "discord_ip_discovery,stun",
             Self::Known => "known",
             Self::All => "all",
         }

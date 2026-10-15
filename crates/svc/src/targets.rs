@@ -138,10 +138,12 @@ pub fn group(host: &str) -> Group {
     }
 }
 
+/// What goes through the bypass for an entry: a whole catalog service, or just that host and its
+/// subdomains. A blocked play.google.com must not pull all of google.com into the bypass.
 pub fn expand(host: &str) -> Vec<String> {
     match service_of(host) {
         Some(service) => service.domains.clone(),
-        None => vec![base_domain(host)],
+        None => vec![host.to_owned()],
     }
 }
 

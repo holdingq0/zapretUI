@@ -17,7 +17,10 @@ pub fn enabled() -> bool {
 
 pub fn set(enabled: bool) -> anyhow::Result<()> {
     if enabled {
-        let command = format!("\"{}\" --tray", std::env::current_exe()?.display());
+        // The installed copy, even when the switch was flipped in a copy started from a download.
+        let installed = rkn_core::paths::app_exe();
+        let exe = if installed.is_file() { installed } else { std::env::current_exe()? };
+        let command = format!("\"{}\" --tray", exe.display());
         let wide: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
         unsafe {
             RegSetKeyValueW(

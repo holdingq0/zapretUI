@@ -38,7 +38,7 @@ pub fn run_portable(after: Option<u32>) -> anyhow::Result<()> {
     runtime()?.block_on(app::run(window_gone()))
 }
 
-fn wait_exit(pid: u32) {
+pub fn wait_exit(pid: u32) {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
     unsafe {

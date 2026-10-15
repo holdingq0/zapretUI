@@ -46,6 +46,8 @@ pub struct LearnCtx {
     pub network: Network,
     pub engine_dir: PathBuf,
     pub extra: Vec<String>,
+    /// The strategies that worked here before: a new search tries them first.
+    pub seed: Reserve,
 }
 
 struct Inner {
@@ -113,6 +115,23 @@ impl Inner {
 
     fn covered(&self, host: &str) -> bool {
         self.hosts.iter().any(|h| targets::within(host, h)) || self.confirmed(host)
+    }
+
+    /// Discord is blocked here, so its calls need the voice profile as well.
+    fn voice(&self) -> bool {
+        let discord = targets::by_name("Discord").map(targets::Service::id).unwrap_or_default();
+        !discord.is_empty() && self.confirmed(&discord) && self.sites.mode(&discord) != SiteMode::Never
+    }
+
+    fn plan(&self) -> Option<rkn_engine::Plan> {
+        engine::build_plan(&self.sites, &self.reserve(), self.has_probed, self.has_direct, self.voice())
+    }
+
+    /// The last search on this network ended long enough ago, across restarts of the service too.
+    fn learn_due(&self) -> bool {
+        let recent = self.last_learn.is_some_and(|at| at.elapsed() < RELEARN_AFTER);
+        let saved = self.memory.as_ref().is_some_and(|m| now().saturating_sub(m.learned_at) < RELEARN_AFTER.as_secs());
+        !recent && !saved
     }
 }
 
@@ -257,6 +276,10 @@ impl Hub {
         };
         {
             let mut inner = hub.lock();
+            // Only with the network known: at boot before Wi-Fi is up it is not, and home must not go.
+            if !inner.network.is_unknown() {
+                rkn_core::memory::prune(&inner.network.id, Duration::from_secs(365 * 24 * 3600));
+            }
             hub.load_memory(&mut inner);
             sync_lists(&mut inner);
             if inner.config.enabled && !inner.network.is_unknown() {
@@ -289,17 +312,17 @@ impl Hub {
             let Some(memory) = inner.memory.as_mut() else { continue };
             let verdict = probe.outcome.verdict;
             if verdict.fixable() {
-                let group = targets::group(&host);
-                if !memory.blocked.contains(&group.id) {
-                    memory.blocked.push(group.id.clone());
+                let service = targets::service_of(&host).map(|_| targets::group(&host));
+                let entry = service.as_ref().map_or_else(|| host.clone(), |g| g.id.clone());
+                if !memory.blocked.contains(&entry) {
+                    memory.blocked.push(entry.clone());
                     memory.blocked.sort();
                     dirty = true;
-                    let text = if targets::service_of(&host).is_some() {
-                        format!("{}: провайдер режет. Весь сервис идёт через обход", group.name)
-                    } else {
-                        format!("{}: заблокирован. Добавлен в обход", group.name)
+                    let text = match &service {
+                        Some(group) => format!("{}: провайдер режет. Весь сервис идёт через обход", group.name),
+                        None => format!("{host}: не открывается напрямую. Идёт через обход"),
                     };
-                    events.push(Event::new(Level::Info, text).host(group.id));
+                    events.push(Event::new(Level::Info, text).host(entry));
                 }
             } else if verdict != Verdict::Failed {
                 tracing::info!(host, ?verdict, "autohostlist entry opens directly, excluded");
@@ -420,7 +443,7 @@ impl Hub {
             return;
         }
         inner.restart_at = None;
-        let Some(plan) = engine::build_plan(&inner.sites, &inner.reserve(), inner.has_probed, inner.has_direct) else {
+        let Some(plan) = inner.plan() else {
             inner.planned = false;
             engine::unload_driver();
             return;
@@ -432,6 +455,8 @@ impl Hub {
             inner.problem = Some(Problem::Failed(format!("Файлы движка повреждены: {e:#}. Переустановите zapretUI")));
         } else {
             touch(paths::autohostlist_file());
+            // Starting waits for the driver; the window shows "Запуск" meanwhile instead of the old state.
+            self.publish(inner);
             if let Err(e) = inner.engine.start(&plan) {
                 let text = format!("{e:#}");
                 self.emit(Event::new(Level::Warn, format!("winws2 не запустился: {text}. Повтор через 2 с")));
@@ -567,7 +592,7 @@ impl Hub {
                 let text = format!("Файлы движка повреждены: {e:#}. Переустановите zapretUI");
                 self.emit(Event::new(Level::Error, text.clone()));
                 inner.problem = Some(Problem::Failed(text));
-            } else if let Some(plan) = engine::build_plan(&inner.sites, &inner.reserve(), inner.has_probed, inner.has_direct) {
+            } else if let Some(plan) = inner.plan() {
                 match inner.engine.start(&plan) {
                     Ok(_) => inner.last_error = None,
                     Err(e) => inner.last_error = Some(format!("{e:#}")),
@@ -661,7 +686,12 @@ impl Hub {
         inner.learning = Some(phase_text(Phase::Probing).into());
         inner.learn = Some(Box::new(Learn { phase: Phase::Probing, percent: 0, log: Vec::new() }));
         self.publish(&mut inner);
-        Some(LearnCtx { network: inner.network.clone(), engine_dir: inner.engine.dir().to_path_buf(), extra: inner.extra_hosts() })
+        Some(LearnCtx {
+            network: inner.network.clone(),
+            engine_dir: inner.engine.dir().to_path_buf(),
+            extra: inner.extra_hosts(),
+            seed: inner.reserve(),
+        })
     }
 
     pub fn learn_probed(&self, line: Option<LogLine>, done: usize, total: usize) {
@@ -840,7 +870,9 @@ impl Hub {
         Some(inner.extra_hosts())
     }
 
-    pub fn finish_check(&self, probes: Vec<Probed>) -> bool {
+    /// Returns the catalog services that stopped opening through the bypass, when a new search
+    /// would be due. The caller checks them again before blaming the provider.
+    pub fn finish_check(&self, probes: Vec<Probed>) -> Vec<Probed> {
         let mut inner = self.lock();
         inner.checking = false;
         let was_whitelist = inner.whitelist;
@@ -854,24 +886,80 @@ impl Hub {
 
         let working = sites.iter().filter(|p| matches!(p.outcome.verdict, Verdict::Ok | Verdict::DnsSpoofed)).count();
         let failing: Vec<&Probed> = sites.iter().copied().filter(|p| p.outcome.verdict.fixable()).collect();
-        let unfixed: Vec<String> = inner.memory.as_ref().map(|m| m.unfixed.clone()).unwrap_or_default();
-        let fresh: Vec<&Probed> = failing.iter().copied().filter(|p| !unfixed.contains(&p.target.host)).collect();
-        if !fresh.is_empty() {
-            let verb = if fresh.len() == 1 { "перестал" } else { "перестали" };
-            let rest = if working > 0 { ". Остальные сайты работают как обычно" } else { "" };
-            inner.learn_reason = Some(format!("{} {verb} открываться{rest}", tuner::names(&fresh)));
-        }
-        let mut text = format!("Проверка: открываются {working} из {}", sites.len());
         if !failing.is_empty() {
-            text.push_str(&format!(". Не открываются: {}", tuner::names(&failing)));
-        }
-        if !failing.is_empty() {
+            let text = format!("Проверка: открываются {working} из {}. Не открываются: {}", sites.len(), tuner::names(&failing));
             self.emit(Event::new(Level::Warn, text));
         }
-        let due = inner.last_learn.is_none_or(|at| at.elapsed() > RELEARN_AFTER);
-        let relearn = inner.config.enabled && !inner.whitelist && !fresh.is_empty() && due;
+        let suspects = if tuner::online(&probes) && watching(&inner) {
+            let unfixed: Vec<String> = inner.memory.as_ref().map(|m| m.unfixed.clone()).unwrap_or_default();
+            // Sites outside the catalog never start a search: one slow site is no reason to retune the rest.
+            failing
+                .into_iter()
+                .filter(|p| !unfixed.contains(&p.target.host) && targets::service_of(&p.target.host).is_some())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.publish(&mut inner);
-        relearn
+        suspects
+    }
+
+
+    /// A repeated probe of sites that failed the check: its results replace the old ones.
+    pub fn rechecked(&self, probes: &[Probed]) {
+        let mut inner = self.lock();
+        for p in probes.iter().filter(|p| !p.control && p.target.tls) {
+            inner.checks.insert(p.target.host.clone(), p.outcome.verdict);
+        }
+        self.publish(&mut inner);
+    }
+
+    /// The suspects failed every repeated check too. A new search starts if one is due; when the
+    /// strategy was found just now and still does not open them, a search cannot help them: they
+    /// are remembered as not fixable and stop starting searches.
+    pub fn confirm_relearn(&self, still: &[Probed]) -> bool {
+        let mut inner = self.lock();
+        if still.is_empty() || !watching(&inner) {
+            return false;
+        }
+        let refs: Vec<&Probed> = still.iter().collect();
+        let fresh = inner.memory.as_ref().is_some_and(|m| now().saturating_sub(m.learned_at) < RELEARN_AFTER.as_secs());
+        if fresh {
+            let network = inner.network.id.clone();
+            if let Some(memory) = inner.memory.as_mut() {
+                for p in &refs {
+                    if !memory.unfixed.contains(&p.target.host) {
+                        memory.unfixed.push(p.target.host.clone());
+                    }
+                }
+                memory.unfixed.sort();
+                if let Err(e) = memory.save(&network) {
+                    tracing::warn!("network memory: {e:#}");
+                }
+            }
+            let text = format!(
+                "{}: подобранный способ обхода не помогает, похоже на блокировку по адресу. Переподбор из-за этого не запускается",
+                tuner::names(&refs)
+            );
+            self.emit(Event::new(Level::Warn, text));
+            self.publish(&mut inner);
+            return false;
+        }
+        // A search of its own never starts during a game: trial engines and bursts of probes are
+        // not worth a lag spike. The first check after the game picks it up.
+        if !inner.learn_due() || !inner.procs.is_empty() {
+            return false;
+        }
+        let names: Vec<String> = refs.iter().map(|p| p.name.clone()).collect();
+        let others = inner
+            .checks
+            .iter()
+            .any(|(host, v)| matches!(v, Verdict::Ok) && !names.contains(&targets::name(host)));
+        let verb = if names.iter().collect::<BTreeSet<_>>().len() == 1 { "перестал" } else { "перестали" };
+        let rest = if others { ". Остальные сайты работают как обычно" } else { "" };
+        inner.learn_reason = Some(format!("{} {verb} открываться{rest}", tuner::names(&refs)));
+        true
     }
 
     pub fn handle(&self, request: Request) -> Message {
@@ -966,6 +1054,11 @@ impl Hub {
     }
 }
 
+/// The background check may act on what it finds: the bypass is on and has a strategy to judge.
+fn watching(inner: &Inner) -> bool {
+    inner.config.enabled && !inner.whitelist && inner.learning.is_none() && inner.memory.is_some()
+}
+
 fn status(inner: &mut Inner) -> Status {
     let running = inner.engine.running();
     let mut unfixed = inner.memory.as_ref().map(|m| m.unfixed.clone()).unwrap_or_default();
@@ -1000,10 +1093,9 @@ fn status(inner: &mut Inner) -> Status {
     hosts.extend(inner.checks.iter().filter(|(_, v)| **v != Verdict::Ok).map(|(h, _)| h.clone()));
     hosts.retain(|h| !inner.is_direct(h) || inner.sites.mode(&targets::group(h).id) != SiteMode::Auto);
 
-    let mut groups: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for host in hosts {
-        let group = targets::group(&host);
-        groups.entry(group.id).or_insert_with(|| (group.name, Vec::new())).1.push(host);
+        groups.entry(targets::group(&host).id).or_default().push(host);
     }
 
     let mut sites: Vec<SiteStatus> = Vec::new();
@@ -1013,21 +1105,16 @@ fn status(inner: &mut Inner) -> Status {
         if service.kind == Kind::Site && service.probe.is_empty() && found.is_none() {
             continue;
         }
-        let mut members = found.map(|(_, m)| m).unwrap_or_default();
+        let mut members = found.unwrap_or_default();
         for host in &service.probe {
             if !members.contains(host) {
                 members.push(host.clone());
             }
         }
-        sites.push(row(inner, state, running, id, service.name.clone(), members, Some(service)));
+        sites.push(row(inner, state, running, id, service.name.clone(), members, service));
     }
-    // Hosts found outside the catalog: listed while they go through the bypass or fail, not when they just open.
-    for (id, (name, members)) in groups {
-        let found = row(inner, state, running, id, name, members, None);
-        if found.via || found.mode != SiteMode::Auto || !matches!(found.state, SiteState::Direct | SiteState::Unknown | SiteState::Checking) {
-            sites.push(found);
-        }
-    }
+    // Hosts outside the catalog (the engine's own finds) still go through the bypass, but the window
+    // lists only the services people know: a row for every flaky site would only confuse.
 
     Status {
         state,
@@ -1049,13 +1136,13 @@ fn row(
     id: String,
     name: String,
     members: Vec<String>,
-    service: Option<&targets::Service>,
+    service: &targets::Service,
 ) -> SiteStatus {
     let mode = match inner.sites.mode(&id) {
         SiteMode::Auto => members.iter().map(|h| inner.sites.mode(h)).find(|m| *m != SiteMode::Auto).unwrap_or_default(),
         other => other,
     };
-    let launcher = service.filter(|s| s.probe.is_empty()).and_then(|s| s.launcher.as_deref()).and_then(targets::by_name);
+    let launcher = Some(service).filter(|s| s.probe.is_empty()).and_then(|s| s.launcher.as_deref()).and_then(targets::by_name);
     let probes: &[String] = match launcher {
         Some(l) => &l.probe,
         None => &members,
@@ -1064,13 +1151,14 @@ fn row(
     let covered = inner.covered(&id)
         || members.iter().any(|h| inner.covered(h))
         || launcher.is_some_and(|l| inner.covered(&l.id()));
-    let verifying = !covered && !members.is_empty() && members.iter().all(|h| inner.verifying.contains(h));
     let site_state = {
         match (mode, state, check) {
             (SiteMode::Never, _, _) | (_, State::Paused, None) => SiteState::Direct,
-            _ if inner.checking || verifying => SiteState::Checking,
+            // A check keeps the last result on screen; only a service never checked waits for it.
+            (_, _, None) if inner.checking && !(covered && state == State::Working && running) => SiteState::Checking,
             (_, _, Some(verdict)) => match verdict {
-                Verdict::Ok if running && (covered || mode == SiteMode::Always) => SiteState::Bypassed,
+                // A restart of the engine (new hosts, a new strategy) takes a second: the rows stay as they were.
+                Verdict::Ok if (running || state == State::Starting) && (covered || mode == SiteMode::Always) => SiteState::Bypassed,
                 Verdict::Ok => SiteState::Direct,
                 Verdict::DnsSpoofed => SiteState::DnsSpoofed,
                 Verdict::IpBlocked => SiteState::IpBlocked,
@@ -1085,17 +1173,16 @@ fn row(
             _ => SiteState::Unknown,
         }
     };
-    let launched = service.is_some_and(|s| s.processes.iter().any(|p| inner.procs.contains(&p.to_ascii_lowercase())));
+    let launched = service.processes.iter().any(|p| inner.procs.contains(&p.to_ascii_lowercase()));
     SiteStatus {
         id,
         name,
         state: site_state,
         mode,
-        kind: service.map(|s| s.kind).unwrap_or_default(),
-        icon: service.and_then(|s| s.icon.clone()),
+        kind: service.kind,
+        icon: service.icon.clone(),
         running: launched,
         via: mode != SiteMode::Never && (covered || mode == SiteMode::Always),
-        found: service.is_none(),
     }
 }
 

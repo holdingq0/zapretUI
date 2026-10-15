@@ -35,6 +35,11 @@ domains = ["cloudflare.com"]
 probe = ["www.cloudflare.com"]
 
 [[service]]
+name = "itch.io"
+domains = ["itch.io", "itch.zone"]
+probe = ["itch.io"]
+
+[[service]]
 name = "SoundCloud"
 domains = ["soundcloud.com", "sndcdn.com"]
 

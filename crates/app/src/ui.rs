@@ -65,7 +65,6 @@ pub enum Hit {
     Back,
     Action,
     Relearn,
-    Found,
     Update,
     Toggle(usize),
 }
@@ -138,7 +137,8 @@ pub struct Ui {
     pub screen: Screen,
     /// The service is not registered: the home screen offers to install it.
     pub missing: bool,
-    found_open: bool,
+    /// Installed, but the service does not answer: the button starts it.
+    pub stopped: bool,
     pub focused: bool,
     pub hover: Option<Hit>,
     pub press: Option<Hit>,
@@ -216,7 +216,7 @@ impl Ui {
         Self {
             screen: Screen::Home,
             missing: false,
-            found_open: false,
+            stopped: false,
             focused: false,
             hover: None,
             press: None,
@@ -281,7 +281,7 @@ impl Ui {
         } else {
             self.learn.set(percent, now);
         }
-        let view = text::view(connected, self.missing, status);
+        let view = text::view(connected, self.missing, self.stopped, status);
         if view.title != self.title.0 {
             self.title = (view.title, now);
         }
@@ -355,12 +355,8 @@ impl Ui {
             Hit::Services => self.go(Screen::Services),
             Hit::Settings => self.go(Screen::Settings),
             Hit::Back => self.go(Screen::Home),
-            Hit::Action if self.missing => Act::Install,
+            Hit::Action if self.missing || self.stopped => Act::Install,
             Hit::Action | Hit::Relearn if learning => Act::StopLearning,
-            Hit::Found => {
-                self.found_open = !self.found_open;
-                Act::None
-            }
             Hit::Update => match status.map(|s| s.update.state) {
                 Some(UpdateState::Available) => Act::InstallUpdate,
                 _ => Act::CheckUpdate,
@@ -677,7 +673,7 @@ impl Ui {
             self.label(c, &l, (W - 310.0) / 2.0, ty + 44.0, t.soft, k);
         }
 
-        let view = text::view(true, self.missing, status);
+        let view = text::view(true, self.missing, self.stopped, status);
         let mut below = ty + 44.0 + sub_h.max(16.0) + 14.0;
         let learn = status.and_then(|s| s.learn.as_ref()).filter(|_| learning);
         if let Some(learn) = learn {
@@ -777,41 +773,23 @@ impl Ui {
         let mut y = top - self.scroll;
         let mut games: Vec<_> = sites.iter().filter(|s| s.kind == Kind::Game).collect();
         games.sort_by_key(|s| !s.running);
-        let found: Vec<_> = sites.iter().filter(|s| s.found).collect();
         let groups = [
-            ("САЙТЫ", sites.iter().filter(|s| s.kind == Kind::Site && !s.found).collect::<Vec<_>>()),
+            ("САЙТЫ", sites.iter().filter(|s| s.kind == Kind::Site).collect::<Vec<_>>()),
             ("ИГРЫ", games),
             ("ЛАУНЧЕРЫ", sites.iter().filter(|s| s.kind == Kind::Launcher).collect()),
-            // Sites the bypass found on its own, folded away until asked for.
-            ("НАЙДЕННЫЕ", found),
         ];
         if sites.is_empty() {
-            let msg = if status.is_some() { "> список появится после первой проверки" } else { "> служба не отвечает" };
+            let msg = if status.is_some() { "> список появится после первой проверки" } else { "> нет связи со службой" };
             let l = g.layout(msg, Font::Mono, 11.5, 400, W - 40.0);
             align(&l, DWRITE_TEXT_ALIGNMENT_CENTER);
             self.label(c, &l, 20.0, top + 24.0, t.mute, k);
         }
         for (title, items) in groups.iter().filter(|(_, items)| !items.is_empty()) {
-            let foldable = *title == "НАЙДЕННЫЕ";
-            let head_text = if foldable {
-                format!("{} // {title} {}", if self.found_open { "[-]" } else { "[+]" }, items.len())
-            } else {
-                format!("// {title}")
-            };
-            let hv = if foldable { self.hov(Hit::Found, Instant::now()) } else { 0.0 };
-            let head = g.layout(&head_text, Font::Mono, 10.5, 600, 0.0);
+            let head = g.layout(&format!("// {title}"), Font::Mono, 10.5, 600, 0.0);
             let hw = metrics(&head).width;
-            self.label(c, &head, 18.0, y, t.mute.mix(t.fg, hv), k);
-            if foldable {
-                self.hits.push((rect(12.0, y - 4.0, W - 24.0, 20.0), Hit::Found));
-            }
+            self.label(c, &head, 18.0, y, t.mute, k);
             let through = items.iter().filter(|s| s.state == SiteState::Bypassed).count();
             let mut lead_end = W - 18.0;
-            if foldable && !self.found_open {
-                self.dotted(c, 18.0 + hw + 8.0, lead_end, y + 8.0, t.faint, k);
-                y += 28.0;
-                continue;
-            }
             if through > 0 {
                 let l = g.layout(&format!("{through} через обход"), Font::Mono, 10.5, 400, 160.0);
                 align(&l, DWRITE_TEXT_ALIGNMENT_TRAILING);
@@ -862,6 +840,8 @@ impl Ui {
         }
         c.unclip();
         self.max_scroll = (y + self.scroll - top - (H - top - 16.0)).max(0.0);
+        // The list got shorter (a service left it): no blank space below the last row.
+        self.scroll = self.scroll.min(self.max_scroll);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -912,7 +892,7 @@ impl Ui {
         let learning = status.is_some_and(|s| s.state == State::Learning);
         let by = panel.bottom + 24.0;
         if status.is_some() {
-            let label = if learning { "Остановить подбор" } else { "Подобрать обход заново" };
+            let label = if learning { "Остановить настройку" } else { "Настроить заново" };
             self.button(c, g, t, label, W / 2.0, by, 32.0, 12.0, Hit::Relearn, k);
             let hint = if learning { "Сейчас подбирается способ под вашу сеть" } else { "Если какой-то сервис перестал открываться" };
             let l = g.layout(hint, Font::Mono, 10.5, 400, W - 40.0);

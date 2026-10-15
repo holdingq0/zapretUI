@@ -101,6 +101,11 @@ pub async fn fetch(target: &Target, ip: IpAddr, ports: Option<&PortBlock>, opts:
     let fetched = if target.tls {
         match tls::handshake(tcp, &target.host, opts.idle).await {
             Ok(stream) => http::get(stream, target, opts.want, opts.idle).await,
+            // A certificate the server did send but that does not check out is not DPI: a wrong clock
+            // on this computer or a filter that swaps certificates. No bypass strategy fixes it.
+            Err(e) if tls::bad_certificate(&e) => {
+                return Outcome::new(Verdict::Failed, Some(ip), format!("сертификат не прошёл проверку: {e}"));
+            }
             Err(e) => return Outcome::new(Verdict::TlsBlocked, Some(ip), format!("TLS: {}", net::describe(&e))),
         }
     } else {
