@@ -143,10 +143,11 @@ pub async fn fetch(target: &Target, ip: IpAddr, ports: Option<&PortBlock>, opts:
 pub async fn probe(target: &Target, ports: Option<&PortBlock>, opts: Opts) -> Outcome {
     let system = system_global(&target.host).await;
     let mut last: Option<Outcome> = None;
-    // A single address gets a second try: one lost connection is not a block by IP.
+    // A single address gets a second try: one lost connection is not a block by IP. Big services
+    // hand out many addresses and a browser walks through them, so a few of them are tried too.
     let tries: Vec<IpAddr> = match system.as_slice() {
         [only] => vec![*only, *only],
-        many => many.iter().take(2).copied().collect(),
+        many => many.iter().take(4).copied().collect(),
     };
     for ip in &tries {
         let outcome = fetch(target, *ip, ports, opts).await;
@@ -166,15 +167,15 @@ pub async fn probe(target: &Target, ports: Option<&PortBlock>, opts: Opts) -> Ou
         for ip in doh_global(&target.host, &system).await.iter().take(2) {
             let outcome = fetch(target, *ip, ports, opts).await;
             if outcome.verdict == Verdict::Ok {
-                // Only a resolver that gave no real address is lying. One that gave a blocked
-                // address of the same service is not, and DoH would not fix the browser either.
+                // Only a resolver that gave no real address is lying. One that gave some dead
+                // addresses of a service that answers at others is not: the site opens.
                 return match spoofed {
                     true => Outcome {
                         verdict: Verdict::DnsSpoofed,
                         detail: "провайдер выдаёт неверный адрес, по DoH сайт открывается".into(),
                         ..outcome
                     },
-                    false => Outcome::new(Verdict::IpBlocked, outcome.ip, "часть адресов сервиса заблокирована по IP"),
+                    false => Outcome { detail: "часть адресов сервиса не отвечает".into(), ..outcome },
                 };
             }
             // Reachable at another address, and there the name is blocked: that is DPI, and the bypass helps.

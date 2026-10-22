@@ -35,6 +35,8 @@ const RELEARN_AFTER: Duration = Duration::from_secs(30 * 60);
 const LEARN_LOG: usize = 16;
 const DIRECT_TTL: u64 = 24 * 3600;
 const RESTART_DELAY: Duration = Duration::from_secs(2);
+/// An engine restarted after a crash counts as recovered only after this much work.
+const STABLE_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq)]
 enum Problem {
@@ -62,6 +64,7 @@ struct Inner {
     problem: Option<Problem>,
     crashes: u32,
     retry_at: Option<Instant>,
+    restarted_at: Option<Instant>,
     last_error: Option<String>,
     hosts: BTreeSet<String>,
     learning: Option<String>,
@@ -80,6 +83,7 @@ struct Inner {
     procs: BTreeSet<String>,
     has_probed: bool,
     has_direct: bool,
+    has_ipset: bool,
     update: Update,
     updating: bool,
 }
@@ -126,7 +130,7 @@ impl Inner {
     }
 
     fn plan(&self) -> Option<rkn_engine::Plan> {
-        engine::build_plan(&self.sites, &self.reserve(), self.has_probed, self.has_direct, self.voice())
+        engine::build_plan(&self.sites, &self.reserve(), self.has_probed, self.has_direct, self.has_ipset, self.voice())
     }
 
     /// The last search on this network ended long enough ago, across restarts of the service too.
@@ -191,9 +195,11 @@ fn sync_lists(inner: &mut Inner) {
     probed.dedup();
     direct.sort();
     direct.dedup();
+    let ipset = memory.map(|m| targets::hosting_ipset(&m.blocked)).unwrap_or_default();
     inner.has_probed = !probed.is_empty();
     inner.has_direct = !direct.is_empty();
-    for (path, list) in [(paths::probed_file(), probed), (paths::direct_file(), direct)] {
+    inner.has_ipset = !ipset.is_empty();
+    for (path, list) in [(paths::probed_file(), probed), (paths::direct_file(), direct), (engine::ipset_file(), ipset)] {
         let body: String = list.iter().map(|h| format!("{h}\n")).collect();
         if let Err(e) = paths::write_atomic(&path, &body) {
             tracing::warn!("{}: {e}", path.display());
@@ -247,6 +253,7 @@ impl Hub {
                 problem: None,
                 crashes: 0,
                 retry_at: None,
+                restarted_at: None,
                 last_error: None,
                 hosts: read_autohostlist(),
                 learning: None,
@@ -265,6 +272,7 @@ impl Hub {
                 procs: BTreeSet::new(),
                 has_probed: false,
                 has_direct: false,
+                has_ipset: false,
                 // Not "off" for the first moments of a fresh start: the window would say updates are disabled.
                 update: Update {
                     state: if update::enabled() { UpdateState::Idle } else { UpdateState::Off },
@@ -309,6 +317,7 @@ impl Hub {
 
     pub fn verified(&self, probes: Vec<Probed>) {
         let mut inner = self.lock();
+        let before = inner.plan().map(|p| p.args());
         let mut dirty = false;
         let mut removed: Vec<String> = Vec::new();
         let mut events: Vec<Event> = Vec::new();
@@ -351,7 +360,11 @@ impl Hub {
             for event in events {
                 self.emit(event);
             }
-            inner.restart_at.get_or_insert(Instant::now() + RESTART_DELAY);
+            // winws2 rereads changed list files by itself; a restart drops every open connection,
+            // so it is only for a new command line (the first list file, voice for Discord).
+            if inner.plan().map(|p| p.args()) != before {
+                inner.restart_at.get_or_insert(Instant::now() + RESTART_DELAY);
+            }
         }
         self.publish(&mut inner);
     }
@@ -439,6 +452,10 @@ impl Hub {
     }
 
     fn apply_locked(&self, inner: &mut Inner) {
+        // The update is replacing engine files: resume_after_update applies the settings afterwards.
+        if inner.updating {
+            return;
+        }
         inner.engine.stop();
         inner.retry_at = None;
         inner.crashes = 0;
@@ -600,13 +617,18 @@ impl Hub {
                 inner.problem = Some(Problem::Failed(text));
             } else if let Some(plan) = inner.plan() {
                 match inner.engine.start(&plan) {
-                    Ok(_) => inner.last_error = None,
+                    Ok(_) => {
+                        inner.last_error = None;
+                        inner.restarted_at = Some(Instant::now());
+                    }
                     Err(e) => inner.last_error = Some(format!("{e:#}")),
                 }
             }
         }
-        if inner.crashes > 0 && inner.retry_at.is_none() && inner.engine.running() {
-            inner.crashes = inner.crashes.saturating_sub(1);
+        // An engine that dies seconds after each restart must reach MAX_CRASHES, not restart forever.
+        let stable = inner.restarted_at.is_some_and(|at| at.elapsed() >= STABLE_AFTER);
+        if inner.crashes > 0 && inner.retry_at.is_none() && stable && inner.engine.running() {
+            inner.crashes = 0;
         }
 
         if changed || inner.unpublished {

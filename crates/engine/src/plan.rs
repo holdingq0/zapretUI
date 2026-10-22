@@ -33,6 +33,8 @@ pub struct Plan {
     pub wf_udp_out: String,
     pub raw_filter: Option<String>,
     pub lua_files: Vec<PathBuf>,
+    /// Named fakes for recipes with `Blob::Named`: name and "0xHEX".
+    pub blobs: Vec<(String, String)>,
     pub debug_log: Option<PathBuf>,
     pub profiles: Vec<Profile>,
 }
@@ -128,6 +130,9 @@ impl Plan {
         }
         for f in &self.lua_files {
             out.push(format!("--lua-init=@{}", f.display()));
+        }
+        for (name, value) in &self.blobs {
+            out.push(format!("--blob={name}:{value}"));
         }
         if let Some(p) = &self.debug_log {
             out.push(format!("--debug=@{}", p.display()));

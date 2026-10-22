@@ -43,6 +43,36 @@ probe = ["itch.io"]
 name = "SoundCloud"
 domains = ["soundcloud.com", "sndcdn.com"]
 
+# Hostings where DPI cuts connections at 16-20 KB: the probe downloads a big file, and once it is
+# cut, all of the hosting's subnets (resources/ipset-hosting.txt) go through the bypass.
+[[service]]
+name = "Сайты на Linode"
+domains = ["linode.com"]
+probe = ["speedtest.frankfurt.linode.com"]
+path = "/100MB-frankfurt.bin"
+ipset = "linode"
+
+[[service]]
+name = "Сайты на Vultr"
+domains = ["vultr.com"]
+probe = ["fra-de-ping.vultr.com"]
+path = "/vultr.com.100MB.bin"
+ipset = "vultr"
+
+[[service]]
+name = "Сайты на Hetzner"
+domains = ["hetzner.com", "hetzner.de", "your-server.de"]
+probe = ["nbg1-speed.hetzner.com"]
+path = "/100MB.bin"
+ipset = "hetzner"
+
+[[service]]
+name = "Сайты на OVH"
+domains = ["ovh.net", "ovh.com", "ovhcloud.com"]
+probe = ["proof.ovh.net"]
+path = "/files/10Mb.dat"
+ipset = "ovh"
+
 [[service]]
 name = "EA app"
 kind = "launcher"

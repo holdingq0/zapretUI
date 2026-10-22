@@ -10,11 +10,17 @@ pub struct Entry {
     pub host: String,
     #[serde(default)]
     pub http: bool,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 impl Entry {
     pub fn target(&self) -> Target {
-        if self.http { Target::http(self.host.as_str()) } else { Target::https(self.host.as_str()) }
+        let mut target = if self.http { Target::http(self.host.as_str()) } else { Target::https(self.host.as_str()) };
+        if let Some(path) = &self.path {
+            target.path = path.clone();
+        }
+        target
     }
 }
 
@@ -35,6 +41,13 @@ pub struct Service {
     pub processes: Vec<String>,
     #[serde(default)]
     pub launcher: Option<String>,
+    /// What the HTTPS probes fetch instead of "/": a big file shows a cut at 16-20 KB.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Name of this hosting's subnets in resources/ipset-hosting.txt: once the probe sees the cut,
+    /// every site on these addresses goes through the bypass, not only the probed host.
+    #[serde(default)]
+    pub ipset: Option<String>,
 }
 
 impl Service {
@@ -90,10 +103,10 @@ pub fn sites() -> Vec<Entry> {
     let mut out = Vec::new();
     for service in &catalog().service {
         for host in &service.probe {
-            out.push(Entry { name: service.name.clone(), host: host.clone(), http: false });
+            out.push(Entry { name: service.name.clone(), host: host.clone(), http: false, path: service.path.clone() });
         }
         for host in &service.probe_http {
-            out.push(Entry { name: service.name.clone(), host: host.clone(), http: true });
+            out.push(Entry { name: service.name.clone(), host: host.clone(), http: true, path: None });
         }
     }
     out
@@ -149,4 +162,21 @@ pub fn expand(host: &str) -> Vec<String> {
 
 pub fn name(host: &str) -> String {
     group(host).name
+}
+
+/// Subnets of the catalog's hostings whose service is in `blocked`, one per line for --ipset.
+pub fn hosting_ipset(blocked: &[String]) -> Vec<String> {
+    let names: Vec<&str> = catalog()
+        .service
+        .iter()
+        .filter(|s| blocked.iter().any(|b| s.domains.iter().any(|d| within(b, d))))
+        .filter_map(|s| s.ipset.as_deref())
+        .collect();
+    include_str!("../../../resources/ipset-hosting.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(name, _)| names.contains(name))
+        .map(|(_, net)| net.trim().to_owned())
+        .collect()
 }

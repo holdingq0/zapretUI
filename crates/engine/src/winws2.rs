@@ -18,6 +18,10 @@ const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
 const READY_LINE: &str = "windivert initialized";
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
 const KEEP_LINES: usize = 20;
+/// STATUS_DLL_INIT_FAILED: cygwin1.dll sometimes fails to initialize in a process started from a
+/// service. It says nothing about the arguments, so the start is simply repeated.
+const DLL_INIT_FAILED: u32 = 0xC000_0142;
+const START_ATTEMPTS: usize = 3;
 
 #[derive(Default)]
 struct Output {
@@ -46,6 +50,25 @@ fn pump(reader: impl Read + Send + 'static, output: Arc<Output>) {
             }
         }
     });
+}
+
+enum Start {
+    DllInit,
+    Other(anyhow::Error),
+}
+
+impl<E: Into<anyhow::Error>> From<E> for Start {
+    fn from(e: E) -> Self {
+        Self::Other(e.into())
+    }
+}
+
+fn exited(status: std::process::ExitStatus, output: &Output) -> Start {
+    if status.code().map(|c| c as u32) == Some(DLL_INIT_FAILED) {
+        return Start::DllInit;
+    }
+    let reason = output.last().unwrap_or_else(|| status.to_string());
+    Start::Other(anyhow::anyhow!("winws2 завершился сразу после запуска: {reason}"))
 }
 
 pub struct Winws2 {
@@ -89,6 +112,22 @@ impl Winws2 {
         if !self.installed() {
             bail!("winws2 не найден в {}", self.dir.display());
         }
+        let mut attempt = 1;
+        loop {
+            match self.spawn(plan) {
+                Err(Start::DllInit) if attempt < START_ATTEMPTS => {
+                    tracing::debug!(attempt, "winws2 failed to initialize, starting again");
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(Start::DllInit) => bail!("winws2 завершился сразу после запуска: exit code: {DLL_INIT_FAILED:#x}"),
+                Err(Start::Other(e)) => return Err(e),
+                Ok(pid) => return Ok(pid),
+            }
+        }
+    }
+
+    fn spawn(&mut self, plan: &Plan) -> Result<u32, Start> {
         let job = Job::new().context("job object")?;
         let args = plan.args();
         tracing::debug!("winws2 {}", args.join(" "));
@@ -103,7 +142,7 @@ impl Winws2 {
             .context("запуск winws2")?;
         if let Err(e) = job.assign(&child) {
             let _ = child.kill();
-            return Err(e);
+            return Err(e.into());
         }
         let output = Arc::new(Output::default());
         if let Some(out) = child.stdout.take() {
@@ -115,8 +154,7 @@ impl Winws2 {
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             if let Some(status) = child.try_wait()? {
-                let reason = output.last().unwrap_or_else(|| status.to_string());
-                bail!("winws2 завершился сразу после запуска: {reason}");
+                return Err(exited(status, &output));
             }
             if output.ready.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(150));
@@ -129,8 +167,7 @@ impl Winws2 {
             std::thread::sleep(Duration::from_millis(25));
         }
         if let Some(status) = child.try_wait()? {
-            let reason = output.last().unwrap_or_else(|| status.to_string());
-            bail!("winws2 завершился сразу после запуска: {reason}");
+            return Err(exited(status, &output));
         }
         let pid = child.id();
         tracing::debug!(pid, "winws2 started");

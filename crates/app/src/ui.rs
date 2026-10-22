@@ -6,10 +6,11 @@ use std::time::Instant;
 
 use rkn_core::config::Config;
 use rkn_core::ipc::{Kind, LineKind, Link, Phase, SiteState, State, Status, UpdateState};
+use rkn_core::sites::SiteMode;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::DirectWrite::{DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_TRAILING, IDWriteTextLayout};
 
-use crate::field::{Field, Frame, Hole};
+use crate::field::{Field, Frame, Hole, RING_MS, Ripple};
 use crate::gfx::{Canvas, Font, Gfx, align, baseline, ink, metrics, rect};
 use crate::icons;
 use crate::text::{self, Tone};
@@ -67,6 +68,10 @@ pub enum Hit {
     Relearn,
     Update,
     Toggle(usize),
+    /// A row on the services screen, by its place in `Ui::rows`.
+    Site(usize),
+    /// An item of the open mode menu: auto, always through the bypass, always direct.
+    Mode(usize),
 }
 
 /// What a click asks the app to do; runs after the UI state is released.
@@ -82,6 +87,7 @@ pub enum Act {
     InstallUpdate,
     LoadConfig,
     Toggle(usize),
+    SiteMode(String, SiteMode),
 }
 
 pub const TOGGLES: [(&str, &str); 2] = [
@@ -144,6 +150,14 @@ pub struct Ui {
     pub focused: bool,
     pub hover: Option<Hit>,
     pub press: Option<Hit>,
+    /// Where the pointer is over the window, in dips: the field's dots make way for it.
+    pub pointer: Option<(f32, f32)>,
+    /// Click rings, in device pixels and field time.
+    ripples: Vec<Ripple>,
+    /// The services on screen, for clicks on their rows: id and mode.
+    rows: Vec<(String, SiteMode)>,
+    /// The mode menu of a service, open next to its status chip.
+    menu: Option<Menu>,
     hits: Vec<(D2D_RECT_F, Hit)>,
     enter: Tween,
     trace: Tween,
@@ -154,6 +168,8 @@ pub struct Ui {
     voids_next: Vec<D2D_RECT_F>,
     title: (String, Instant),
     sub: (String, Instant),
+    /// Services through the bypass on the badge, and when that number last changed.
+    counted: (usize, Instant),
     scroll: f32,
     max_scroll: f32,
     pub notice: Option<(String, Instant)>,
@@ -162,6 +178,21 @@ pub struct Ui {
     field_drawn: f64,
     field_dirty: bool,
     field: Option<Field>,
+}
+
+/// The mode menu of a service: what it offers, with a word on what each choice means.
+const MODES: [(SiteMode, &str, &str); 3] = [
+    (SiteMode::Auto, "Авто", "по проверкам"),
+    (SiteMode::Always, "Всегда через обход", ""),
+    (SiteMode::Never, "Всегда напрямую", ""),
+];
+
+pub struct Menu {
+    id: String,
+    mode: SiteMode,
+    at: Instant,
+    /// The status chip of its row, placed this frame; None when the row is not on screen.
+    anchor: Option<D2D_RECT_F>,
 }
 
 fn tone_color(t: &Theme, tone: Tone) -> Rgb {
@@ -233,6 +264,7 @@ impl Ui {
             voids_next: Vec::new(),
             title: (String::new(), now),
             sub: (String::new(), now),
+            counted: (0, now),
             scroll: 0.0,
             max_scroll: 0.0,
             notice: None,
@@ -241,7 +273,21 @@ impl Ui {
             field_drawn: -1.0,
             field_dirty: true,
             field: None,
+            pointer: None,
+            ripples: Vec::new(),
+            rows: Vec::new(),
+            menu: None,
         }
+    }
+
+    /// Closes the mode menu; true when one was open.
+    pub fn close_menu(&mut self) -> bool {
+        self.menu.take().is_some()
+    }
+
+    /// A click on the empty background sends a ring through the field.
+    pub fn ring(&mut self, x: f32, y: f32, scale: f32) {
+        self.ripples.push(Ripple { x: x * scale, y: y * scale, at: self.field_ms });
     }
 
     pub fn drop_field(&mut self) {
@@ -260,6 +306,7 @@ impl Ui {
             return Act::None;
         }
         self.screen = screen;
+        self.menu = None;
         self.enter = Tween { from: 0.0, to: 1.0, at: Instant::now(), dur: 0.35 };
         self.scroll = 0.0;
         self.hover = None;
@@ -311,6 +358,9 @@ impl Ui {
             || self.hovers.values().any(|k| k.busy(now))
             || fresh(self.title.1)
             || fresh(self.sub.1)
+            || fresh(self.counted.1)
+            || self.menu.as_ref().is_some_and(|m| fresh(m.at))
+            || (self.focused && self.stirred())
             || self.notice.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs_f32() < 5.4);
         if easing {
             Pace::Smooth
@@ -343,13 +393,18 @@ impl Ui {
             return false;
         }
         let next = (self.scroll - delta * 48.0).clamp(0.0, self.max_scroll);
-        let moved = next != self.scroll;
+        let moved = next != self.scroll || self.menu.take().is_some();
         self.scroll = next;
         moved
     }
 
     pub fn click(&mut self, hit: Hit, status: Option<&Status>) -> Act {
         let learning = status.is_some_and(|s| s.state == State::Learning);
+        // An open menu takes the click: anything but its items and the rows only closes it.
+        if self.menu.is_some() && !matches!(hit, Hit::Mode(_) | Hit::Site(_)) {
+            self.menu = None;
+            return Act::None;
+        }
         match hit {
             Hit::Min => Act::Minimize,
             Hit::Close => Act::Close,
@@ -370,6 +425,18 @@ impl Ui {
                 Act::Relearn
             }
             Hit::Toggle(i) => Act::Toggle(i),
+            // A row opens its menu; the same row again closes it.
+            Hit::Site(i) => {
+                let Some((id, mode)) = self.rows.get(i).cloned() else { return Act::None };
+                let same = self.menu.as_ref().is_some_and(|m| m.id == id);
+                self.menu = (!same).then(|| Menu { id, mode, at: Instant::now(), anchor: None });
+                Act::None
+            }
+            Hit::Mode(i) if i >= MODES.len() => Act::None,
+            Hit::Mode(i) => match self.menu.take() {
+                Some(menu) if MODES[i].0 != menu.mode => Act::SiteMode(menu.id, MODES[i].0),
+                _ => Act::None,
+            },
         }
     }
 
@@ -398,13 +465,27 @@ impl Ui {
         if self.focused {
             self.field_ms = self.clock.elapsed().as_secs_f64() * 1000.0;
         }
-        let due = self.focused && self.field_ms - self.field_drawn >= FIELD_MS;
+        // Dots on the move get every frame; the rest of the time the field runs at its slow rate.
+        let stirred = self.stirred();
+        let due = self.focused && (stirred || self.field_ms - self.field_drawn >= FIELD_MS);
+        let now_ms = self.field_ms;
+        self.ripples.retain(|r| now_ms - r.at < RING_MS);
         if due || self.field_dirty {
             let shapes = shapes(status);
             let holes = self.holes(scale);
             let hot = state.is_some_and(|s| s != State::Paused);
             let busy = matches!(state, Some(State::Learning | State::Starting));
-            let frame = Frame { now: self.field_ms, shapes: &shapes, hot, busy, quiet: self.screen != Screen::Home, holes: &holes };
+            let pointer = self.pointer.filter(|_| self.focused).map(|(x, y)| (x * scale, y * scale));
+            let frame = Frame {
+                now: self.field_ms,
+                pointer,
+                ripples: &self.ripples,
+                shapes: &shapes,
+                hot,
+                busy,
+                quiet: self.screen != Screen::Home,
+                holes: &holes,
+            };
             if let Some(f) = &mut self.field {
                 f.step(g, &frame);
             }
@@ -440,6 +521,58 @@ impl Ui {
         unsafe {
             let _ = c.rt.EndDraw(None, None);
         }
+    }
+
+    /// A dropdown under the status chip of the service it belongs to (above it near the bottom).
+    fn mode_menu(&mut self, c: &Canvas, g: &Gfx, t: &Theme, k: f32) {
+        let Some((anchor, mode, at)) = self.menu.as_ref().and_then(|m| m.anchor.map(|a| (a, m.mode, m.at))) else { return };
+        let (w, item) = (196.0, 30.0);
+        let h = MODES.len() as f32 * item + 8.0;
+        let x = (anchor.right - w).max(16.0);
+        let below = anchor.bottom + 6.0;
+        let y = if below + h > H - 12.0 { anchor.top - 6.0 - h } else { below };
+        // Opens by unrolling from the chip.
+        let open = (at.elapsed().as_secs_f32() / 0.14).min(1.0);
+        let e = 1.0 - (1.0 - open).powi(3);
+        let shown = h * e;
+        let r = if y < anchor.top { rect(x, y + h - shown, w, shown) } else { rect(x, y, w, shown) };
+        c.fill_rect(r, t.bg, k);
+        self.frame(c, r, t.edge.mix(t.fg, 0.3), t.fg, k);
+        self.voids_next.push(rect(r.left - 3.0, r.top - 3.0, w + 6.0, shown + 6.0));
+        if open < 1.0 {
+            return;
+        }
+        // The frame around the items catches clicks too: they must not fall through to a row below.
+        self.hits.push((r, Hit::Mode(MODES.len())));
+        let now = Instant::now();
+        for (i, (option, name, note)) in MODES.iter().enumerate() {
+            let row = rect(x + 4.0, y + 4.0 + i as f32 * item, w - 8.0, item);
+            let v = self.hov(Hit::Mode(i), now);
+            c.fill_rect(row, t.fg, v * k);
+            let ink = t.ink.mix(t.bg, v);
+            let current = *option == mode;
+            // The current mode has a filled square, the others an empty one.
+            let mark = rect(row.left + 9.0, row.top + item / 2.0 - 3.0, 6.0, 6.0);
+            if current {
+                c.fill_rect(mark, if v > 0.5 { t.bg } else { t.ok }, k);
+            } else {
+                c.stroke_round(mark, 0.0, t.mute.mix(t.bg, v), k, 1.0);
+            }
+            let l = g.layout(name, Font::Mono, 11.0, if current { 600 } else { 400 }, 0.0);
+            let m = metrics(&l);
+            c.text(&l, row.left + 24.0, row.top + (item - m.height) / 2.0, ink, k);
+            if !note.is_empty() {
+                let n = g.layout(note, Font::Mono, 9.5, 400, 0.0);
+                let nm = metrics(&n);
+                c.text(&n, row.right - 8.0 - nm.width, row.top + (item - nm.height) / 2.0, t.mute.mix(t.bg, v), k);
+            }
+            self.hits.push((row, Hit::Mode(i)));
+        }
+    }
+
+    /// The field has dots on the move or a click ring running.
+    fn stirred(&self) -> bool {
+        self.field.as_ref().is_some_and(|f| f.stirred) || !self.ripples.is_empty()
     }
 
     // Where text sat last frame, in device pixels.
@@ -580,8 +713,9 @@ impl Ui {
         // The dial sits on a dark disc so the field never runs through it.
         let disc = r + 9.0;
         c.fill_circle(cx, cy, disc, t.bg, k);
-        // The field only knows rectangles: a stack of strips approximates the disc.
-        const STRIPS: usize = 14;
+        // The field only knows rectangles: a stack of strips approximates the disc. A strip per row
+        // of dots or so, or the edge comes out in steps.
+        const STRIPS: usize = 48;
         for i in 0..STRIPS {
             let y0 = cy - disc + 2.0 * disc * i as f32 / STRIPS as f32;
             let mid = y0 + disc / STRIPS as f32 - cy;
@@ -696,8 +830,30 @@ impl Ui {
         let b = g.layout("НАСТРОЙКИ", Font::Mono, 12.0, 600, 0.0);
         let (wa, wb) = (metrics(&a).width + 32.0, metrics(&b).width + 32.0);
         let left = cx - (wa + 10.0 + wb) / 2.0;
-        self.button(c, g, t, "Сервисы", left + wa / 2.0, y, 32.0, 12.0, Hit::Services, k);
+        let w = self.button(c, g, t, "Сервисы", left + wa / 2.0, y, 32.0, 12.0, Hit::Services, k);
         self.button(c, g, t, "Настройки", left + wa + 10.0 + wb / 2.0, y, 32.0, 12.0, Hit::Settings, k);
+        let n = status.filter(|s| s.state == State::Working).map_or(0, text::bypassed);
+        if n > 0 {
+            let right = (left + wa / 2.0 - w / 2.0).round() + w.round();
+            self.counter(c, g, t, n, right, y, now, k);
+        }
+    }
+
+    /// The number of services going through the bypass, as a tag on the corner of the "Services"
+    /// button. A new number flashes for a moment.
+    fn counter(&mut self, c: &Canvas, g: &Gfx, t: &Theme, n: usize, right: f32, top: f32, now: Instant, k: f32) {
+        if self.counted.0 != n {
+            self.counted = (n, now);
+        }
+        let fresh = 1.0 - (now.duration_since(self.counted.1).as_secs_f32() / 0.9).min(1.0);
+        let flash = if fresh > 0.0 && self.blink() { 1.0 } else { 0.0 };
+        let l = g.layout(&n.to_string(), Font::Mono, 10.0, 700, 0.0);
+        let m = metrics(&l);
+        let (h, w) = (15.0, (m.width + 8.0).max(15.0).round());
+        let r = rect((right - w / 2.0).round(), (top - h / 2.0).round(), w, h);
+        c.fill_rect(r, t.ok.mix(t.fg, flash), k);
+        c.text(&l, r.left + (w - m.width) / 2.0, r.top + (h - m.height) / 2.0, t.bg, k);
+        self.voids_next.push(rect(r.left - 2.0, r.top - 2.0, w + 4.0, h + 4.0));
     }
 
     /// Three dotted segments for the learning steps: what the provider blocks, variants, the best on all sites.
@@ -729,13 +885,18 @@ impl Ui {
         let (x0, x1) = (28.0, W - 28.0);
         let start = lines.len().saturating_sub(3);
         let shown = &lines[start..];
+        // One hole for the whole tail: holes per piece of text leave strips of the field between
+        // the key and the text and ragged edges between lines of different length.
+        if !shown.is_empty() {
+            self.voids_next.push(rect(x0 - 6.0, y - 4.0, x1 - x0 + 12.0, shown.len() as f32 * 16.0 + 6.0));
+        }
         for (i, line) in shown.iter().enumerate() {
             let a = k * (0.45 + 0.55 * (i + 1) as f32 / shown.len() as f32);
             let ly = y + i as f32 * 16.0;
             let key = format!("> {}", clip(&line.key, 18));
             let kl = g.layout(&key, Font::Mono, 10.5, 400, 0.0);
             let kw = metrics(&kl).width;
-            self.label(c, &kl, x0, ly, t.soft, a);
+            c.text(&kl, x0, ly, t.soft, a);
             let col = match line.kind {
                 LineKind::Problem => t.bad,
                 LineKind::Chosen => t.ok,
@@ -743,7 +904,7 @@ impl Ui {
             };
             let room = ((x1 - x0 - kw - 10.0) / cw).max(4.0) as usize;
             let tl = g.layout(&clip(&line.text, room), Font::Mono, 10.5, 400, 0.0);
-            self.label(c, &tl, x0 + kw + 10.0, ly, col, a);
+            c.text(&tl, x0 + kw + 10.0, ly, col, a);
         }
     }
 
@@ -772,6 +933,7 @@ impl Ui {
         self.header(c, g, t, "Сервисы", k);
         let sites = status.map(|s| s.sites.as_slice()).unwrap_or_default();
         let top = 92.0;
+        self.rows.clear();
         c.clip(rect(0.0, top, W, H - top));
         let mut y = top - self.scroll;
         let mut games: Vec<_> = sites.iter().filter(|s| s.kind == Kind::Game).collect();
@@ -806,6 +968,20 @@ impl Ui {
             for (i, s) in items.iter().enumerate() {
                 let ry = y + 4.0 + i as f32 * 40.0;
                 let row = rect(20.0, ry, W - 40.0, 40.0);
+                // A game without its own domains has nothing for the service to route: no click.
+                let hit = (!s.id.starts_with("game:")).then(|| {
+                    self.rows.push((s.id.clone(), s.mode));
+                    Hit::Site(self.rows.len() - 1)
+                });
+                let open = self.menu.as_ref().is_some_and(|m| m.id == s.id);
+                let v = match hit {
+                    Some(hit) if row.bottom > top && row.top < H => {
+                        self.hits.push((row, hit));
+                        self.hov(hit, Instant::now())
+                    }
+                    _ => 0.0,
+                };
+                c.fill_rect(row, t.hover, if open { k } else { v * k });
                 if i > 0 {
                     self.dotted(c, 28.0, W - 28.0, ry, t.edge, k);
                 }
@@ -821,6 +997,12 @@ impl Ui {
                 let pw = tm.width + 24.0;
                 let px = row.right - 8.0 - pw;
                 let chip = rect(px, ry + 10.0, pw, 20.0);
+                if open {
+                    if let Some(menu) = &mut self.menu {
+                        menu.anchor = Some(chip);
+                        menu.mode = s.mode;
+                    }
+                }
                 c.fill_rect(chip, color, 0.1 * k);
                 c.stroke_round(chip, 0.0, color, 0.45 * k, 1.0);
                 c.fill_rect(rect(px + 7.0, ry + 18.5, 3.0, 3.0), color, k);
@@ -842,6 +1024,14 @@ impl Ui {
             y += panel.bottom - panel.top + 18.0;
         }
         c.unclip();
+        // The service left the list (or scrolled out of sight): its menu goes too.
+        if self.menu.as_ref().is_some_and(|m| m.anchor.is_none_or(|a| a.bottom < top || a.top > H)) {
+            self.menu = None;
+        }
+        self.mode_menu(c, g, t, k);
+        if let Some(menu) = &mut self.menu {
+            menu.anchor = None;
+        }
         self.max_scroll = (y + self.scroll - top - (H - top - 16.0)).max(0.0);
         // The list got shorter (a service left it): no blank space below the last row.
         self.scroll = self.scroll.min(self.max_scroll);

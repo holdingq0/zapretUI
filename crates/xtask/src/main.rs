@@ -52,14 +52,22 @@ fn sha256(path: &Path) -> anyhow::Result<String> {
 fn keygen() -> anyhow::Result<()> {
     let file = key_file()?;
     ensure!(!file.exists(), "ключ уже есть: {}. Новый ключ сделает старые сборки глухими к обновлениям", file.display());
+    let path = release_toml();
+    let text = std::fs::read_to_string(&path)?;
+    let source: Source = toml::from_str(&text).context("resources/release.toml")?;
+    // On another machine the key file is simply missing: a new key would cut every installed copy off updates.
+    ensure!(
+        source.key.trim().is_empty(),
+        "в {} уже есть открытый ключ, а закрытого нет в {}. Перенесите release.key с машины, где делали релизы",
+        path.display(),
+        file.display()
+    );
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).map_err(|_| anyhow::anyhow!("нет источника случайных чисел"))?;
     let pair = Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| anyhow::anyhow!("ключ не создан"))?;
     std::fs::create_dir_all(file.parent().context("путь ключа")?)?;
     std::fs::write(&file, hex(&seed))?;
 
-    let path = release_toml();
-    let text = std::fs::read_to_string(&path)?;
     let public = hex(pair.public_key().as_ref());
     let text: String = text
         .lines()

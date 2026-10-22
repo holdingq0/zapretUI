@@ -561,6 +561,7 @@ fn act(app: &mut App, act: Act) -> Option<Act> {
             app.config = Some(config.clone());
             send(tray, Tag::Saved, Request::SetConfig { config });
         }
+        Act::SiteMode(host, mode) => send(tray, Tag::Plain, Request::SetSiteMode { host, mode }),
     }
     None
 }
@@ -704,23 +705,25 @@ fn menu(hwnd: HWND) {
             let _ = AppendMenuW(m, flags, item.map_or(0, |i| i as usize), PCWSTR(text.as_ptr()));
         };
         let on = |ok: bool| if ok { MF_STRING } else { MF_STRING | MF_GRAYED };
-        let look = with(|app| tray::look(&app.store.lock().unwrap_or_else(|e| e.into_inner()))).map(|l| l.label).unwrap_or("");
-        add(MF_STRING | MF_GRAYED, None, &format!("zapretUI {}: {look}", env!("CARGO_PKG_VERSION")));
-        add(MF_SEPARATOR, None, "");
+        let check = |flags: MENU_ITEM_FLAGS, checked: bool| if checked { flags | MF_CHECKED } else { flags };
+        // The state is in the icon's colour and tooltip; the menu only holds what can be done.
         add(MF_STRING | MF_DEFAULT, Some(Item::Open), "Открыть");
-        add(on(connected), Some(Item::Power), if paused { "Включить обход" } else { "Выключить обход" });
-        add(on(connected && !paused), Some(Item::Learn), if learning { "Остановить настройку" } else { "Настроить заново" });
-        add(MF_SEPARATOR, None, "");
-        let (text, usable) = match update.state {
-            UpdateState::Available => (format!("Обновить до {}", update.version.clone().unwrap_or_default()), true),
-            UpdateState::Checking => ("Проверяю обновления…".to_string(), false),
-            UpdateState::Downloading => ("Скачиваю обновление…".to_string(), false),
-            UpdateState::Installing => ("Устанавливаю обновление…".to_string(), false),
-            UpdateState::Off => ("Обновления выключены в этой сборке".to_string(), false),
-            _ => ("Проверить обновления".to_string(), true),
+        add(check(on(connected), connected && !paused), Some(Item::Power), "Обход");
+        let learn = match status.as_ref().and_then(|s| s.learn.as_ref()).filter(|_| learning) {
+            Some(l) => format!("Остановить настройку — {}%", l.percent),
+            None => "Настроить заново".to_string(),
         };
-        add(on(connected && usable), Some(Item::Update), &text);
-        add(if autostart { MF_STRING | MF_CHECKED } else { MF_STRING }, Some(Item::Autostart), "Запускать с Windows");
+        add(on(connected && !paused), Some(Item::Learn), &learn);
+        add(MF_SEPARATOR, None, "");
+        // Updates are checked by themselves; the menu speaks up only when there is one.
+        let version = update.version.clone().unwrap_or_default();
+        match update.state {
+            UpdateState::Available => add(on(connected), Some(Item::Update), &format!("Обновить до {version}")),
+            UpdateState::Downloading => add(MF_STRING | MF_GRAYED, None, &format!("Скачиваю {version}…")),
+            UpdateState::Installing => add(MF_STRING | MF_GRAYED, None, &format!("Устанавливаю {version}…")),
+            _ => {}
+        }
+        add(check(MF_STRING, autostart), Some(Item::Autostart), "Запускать с Windows");
         add(MF_SEPARATOR, None, "");
         add(MF_STRING, Some(Item::Quit), "Выход");
         let mut pt = POINT::default();
@@ -735,8 +738,7 @@ fn menu(hwnd: HWND) {
             Item::Power => send(hwnd, Tag::Plain, Request::SetEnabled { enabled: paused }),
             Item::Learn if learning => send(hwnd, Tag::Plain, Request::StopLearning),
             Item::Learn => send(hwnd, Tag::Plain, Request::Relearn),
-            Item::Update if update.state == UpdateState::Available => send(hwnd, Tag::Plain, Request::InstallUpdate),
-            Item::Update => send(hwnd, Tag::Plain, Request::CheckUpdate),
+            Item::Update => send(hwnd, Tag::Plain, Request::InstallUpdate),
             Item::Autostart => toggle_autostart(hwnd, !autostart),
             Item::Quit => exit(),
         }
@@ -803,6 +805,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     let main = app.main.as_mut()?;
                     let scale = main.dpi as f32 / 96.0;
                     let hit = main.ui.hit(px as f32 / scale, py as f32 / scale);
+                    main.ui.pointer = Some((px as f32 / scale, py as f32 / scale));
                     if hit != main.ui.hover {
                         main.ui.hover = hit;
                         invalidate(main);
@@ -822,6 +825,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 with(|app| {
                     if let Some(main) = &mut app.main {
                         main.tracking = false;
+                        main.ui.pointer = None;
                         main.ui.hover = None;
                         main.ui.press = None;
                         invalidate(main);
@@ -836,6 +840,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                         let scale = main.dpi as f32 / 96.0;
                         main.ui.hover = main.ui.hit(px as f32 / scale, py as f32 / scale);
                         main.ui.press = main.ui.hover;
+                        // A click past an open menu only closes it.
+                        if main.ui.hover.is_none() && !main.ui.close_menu() {
+                            main.ui.ring(px as f32 / scale, py as f32 / scale, scale);
+                        }
                     }
                 });
                 LRESULT(0)
@@ -877,6 +885,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
                 let next = with(|app| {
                     let main = app.main.as_mut()?;
+                    if main.ui.close_menu() {
+                        invalidate(main);
+                        return None;
+                    }
                     if main.ui.screen == Screen::Home {
                         return Some(Act::Close);
                     }

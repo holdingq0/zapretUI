@@ -65,23 +65,69 @@ fn from_engine_dir(path: PathBuf) -> PathBuf {
 
 pub const VOICE_PORTS: &str = "19294-19344,50000-50100";
 
+/// The fake that opens Discord calls in zapret-discord-youtube: a QUIC Initial to steamcommunity.com.
+const VOICE_BLOB: &str = "voice_quic";
+const VOICE_BLOB_DATA: &[u8] = include_bytes!("../../../resources/quic_initial_steamcommunity_com.bin");
+
+fn voice_blob() -> (String, String) {
+    let hex: String = VOICE_BLOB_DATA.iter().map(|b| format!("{b:02x}")).collect();
+    (VOICE_BLOB.into(), format!("0x{hex}"))
+}
+
 /// Voice traffic has no host name and cannot be probed without an account, so it gets the
-/// strategy that works on Russian DPI almost everywhere: a burst of zero-filled fakes before
-/// the IP discovery and STUN packets that open a call.
+/// strategy that works on Russian DPI almost everywhere: a burst of fake QUIC Initials before
+/// the IP discovery and STUN packets that open a call. DPI lets zero-filled fakes through.
 pub fn default_voice() -> Vec<Recipe> {
     vec![Recipe {
         payload: Payload::Voice,
-        actions: vec![Action::Fake { blob: Blob::Hex("00".repeat(64)), fooling: vec![], repeats: 6, tls_mod: vec![] }],
+        actions: vec![Action::Fake { blob: Blob::Named(VOICE_BLOB.into()), fooling: vec![], repeats: 6, tls_mod: vec![] }],
     }]
 }
 
+/// Discord voice and video servers also talk TLS on Cloudflare's alternative HTTPS ports.
+pub const DISCORD_MEDIA_PORTS: &str = "2053,2083,2087,2096,8443";
+
+/// QUIC cannot be probed by the service yet. Where TLS needs a bypass, browsers' HTTP/3 to the same
+/// sites gets the strategy Russian DPI gives way to almost everywhere: fake Initials before the real one.
+pub fn default_quic() -> Vec<Recipe> {
+    vec![Recipe {
+        payload: Payload::QuicInitial,
+        actions: vec![Action::Fake { blob: Blob::DefaultQuic, fooling: vec![], repeats: 6, tls_mod: vec![] }],
+    }]
+}
+
+/// Only QUIC long-header packets (Initial, Handshake) leave the kernel: short-header packets carry
+/// the data and the acks of a download, and passing them through winws2 would only cost CPU.
+const QUIC_LONG_HEADER: &str = "(!udp or udp.DstPort != 443 or udp.Payload[0] >= 0xC0)";
+/// Subnets of hostings whose probe was cut at 16-20 KB on this network.
+pub fn ipset_file() -> PathBuf {
+    paths::state_dir().join("ipset-hosting.txt")
+}
+
 /// `voice`: Discord is blocked on this network, so its calls are blocked too.
-pub fn build_plan(sites: &Sites, reserve: &Reserve, probed: bool, direct: bool, voice: bool) -> Option<Plan> {
+/// `ipset`: some hostings cut connections, and every site on their subnets needs the TLS strategy.
+pub fn build_plan(sites: &Sites, reserve: &Reserve, probed: bool, direct: bool, ipset: bool, voice: bool) -> Option<Plan> {
     let voice_recipes = match (&reserve.voice, voice) {
         (own, _) if !own.is_empty() => own.clone(),
         (_, true) => default_voice(),
         _ => Vec::new(),
     };
+    let quic_recipes = match (&reserve.quic, reserve.tls.is_empty()) {
+        (own, _) if !own.is_empty() => own.clone(),
+        (_, false) => default_quic(),
+        _ => Vec::new(),
+    };
+    let discord_media = if voice { reserve.tls.clone() } else { Vec::new() };
+    let hosting = if ipset { reserve.tls.clone() } else { Vec::new() };
+    let mut hosting_filter = Filter {
+        ports: "443".into(),
+        l7: vec!["tls".into()],
+        ipset: vec![from_engine_dir(ipset_file())],
+        ..Filter::default()
+    };
+    if sites.modes.values().any(|m| *m == SiteMode::Never) {
+        hosting_filter.hostlist_exclude.push(from_engine_dir(paths::exclude_file()));
+    }
     let has = |mode: SiteMode| sites.modes.values().any(|m| *m == mode);
     let host_filter = |ports: &str, l7: &[&str]| {
         let mut filter = Filter {
@@ -105,10 +151,22 @@ pub fn build_plan(sites: &Sites, reserve: &Reserve, probed: bool, direct: bool, 
         filter
     };
 
-    let candidates: [(&str, Proto, Filter, &Vec<Recipe>); 4] = [
+    let candidates: [(&str, Proto, Filter, &Vec<Recipe>); 6] = [
         ("tls", Proto::Tcp, host_filter("443", &["tls"]), &reserve.tls),
         ("http", Proto::Tcp, host_filter("80", &["http"]), &reserve.http),
-        ("quic", Proto::Udp, host_filter("443", &["quic"]), &reserve.quic),
+        ("hosting", Proto::Tcp, hosting_filter, &hosting),
+        (
+            "discord_media",
+            Proto::Tcp,
+            Filter {
+                ports: DISCORD_MEDIA_PORTS.into(),
+                l7: vec!["tls".into()],
+                hostlist_domains: vec!["discord.media".into()],
+                ..Filter::default()
+            },
+            &discord_media,
+        ),
+        ("quic", Proto::Udp, host_filter("443", &["quic"]), &quic_recipes),
         (
             "voice",
             Proto::Udp,
@@ -136,19 +194,20 @@ pub fn build_plan(sites: &Sites, reserve: &Reserve, probed: bool, direct: bool, 
     }
 
     let ports = |proto: Proto| {
-        let mut list: Vec<&str> = profiles
-            .iter()
-            .filter(|p| p.proto == proto)
-            .map(|p| p.filter.ports.as_str())
-            .collect();
-        list.dedup();
+        let mut list: Vec<&str> = Vec::new();
+        for p in profiles.iter().filter(|p| p.proto == proto) {
+            if !list.contains(&p.filter.ports.as_str()) {
+                list.push(&p.filter.ports);
+            }
+        }
         list.join(",")
     };
     Some(Plan {
         wf_tcp_out: ports(Proto::Tcp),
         wf_udp_out: ports(Proto::Udp),
-        raw_filter: Some(port_exclude_filter(RESERVED_PORTS.0, RESERVED_PORTS.1)),
+        raw_filter: Some(format!("({}) and {QUIC_LONG_HEADER}", port_exclude_filter(RESERVED_PORTS.0, RESERVED_PORTS.1))),
         lua_files: lua_files(),
+        blobs: if profiles.iter().any(|p| p.name == "voice") { vec![voice_blob()] } else { Vec::new() },
         debug_log: None,
         profiles,
     })

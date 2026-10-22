@@ -28,8 +28,8 @@ const ENOUGH: usize = 6;
 const FINALISTS: usize = 8;
 const KEEP: usize = 4;
 const ROUND1_HITS: usize = 3;
-const ROUND2_HITS: usize = 8;
-const ROUND2_REPEATS: usize = 2;
+const ROUND2_HITS: usize = 12;
+const ROUND2_REPEATS: usize = 3;
 const BUDGET: Duration = Duration::from_secs(240);
 
 static NEXT_BLOCK: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -123,6 +123,12 @@ impl Score {
     fn latency(&self) -> u64 {
         self.latency_sum / self.total().max(1) as u64
     }
+
+    /// The first round makes one attempt per site, and one slow answer must not sink a good candidate:
+    /// with three sites one miss is allowed. The second round checks every site twice anyway.
+    fn won(&self, sites: usize) -> bool {
+        self.total() + usize::from(sites >= 3) >= sites
+    }
 }
 
 #[derive(Default)]
@@ -138,14 +144,16 @@ impl Stats {
     }
 
     fn multiplier(&self, candidate: &Candidate) -> f64 {
-        candidate
+        let product: f64 = candidate
             .features
             .iter()
             .map(|f| match self.0.get(f) {
                 Some((tried, passed)) => ((f64::from(*passed) + 1.0) / (f64::from(*tried) + 2.0) / 0.5).clamp(0.15, 3.0),
                 None => 1.0,
             })
-            .product()
+            .product();
+        // Geometric mean: a candidate with more features must not sink below the priors just for that.
+        product.powf(1.0 / candidate.features.len().max(1) as f64)
     }
 }
 
@@ -181,6 +189,7 @@ fn test_plan(class: Class, recipe: &Recipe, block: &PortBlock) -> Plan {
         wf_udp_out: String::new(),
         raw_filter: Some(port_filter(block.lo(), block.hi())),
         lua_files: lua_files(),
+        blobs: Vec::new(),
         debug_log: None,
         profiles: vec![Profile {
             name: "probe".into(),
@@ -374,7 +383,7 @@ pub async fn search(job: &Job, progress: &(dyn Fn(View) + Send + Sync)) -> anyho
             }
             0 => format!("{n} {} {} из {total}", likely(n), variants_gen(n)),
             _ => {
-                let won = tested.iter().filter(|(_, s)| s.total() == first.len()).count();
+                let won = tested.iter().filter(|(_, s)| s.won(first.len())).count();
                 format!("Подошли {won} из {}, проверяю ещё {n}", tested.len())
             }
         };
@@ -384,6 +393,7 @@ pub async fn search(job: &Job, progress: &(dyn Fn(View) + Send + Sync)) -> anyho
         let n = recipes.len() as f32;
         let mut done = 0f32;
         let need = first.len();
+        // Stopping early needs candidates that opened every site: tolerant winners may all miss the same one.
         let before = tested.iter().filter(|(_, s)| s.total() == need).count();
         let mut enough = |scores: &[Option<Score>]| {
             before + scores.iter().flatten().filter(|s| s.total() == need).count() >= ENOUGH
@@ -404,17 +414,17 @@ pub async fn search(job: &Job, progress: &(dyn Fn(View) + Send + Sync)) -> anyho
         };
         for (candidate, score) in batch.into_iter().zip(scores) {
             let Some(score) = score else { continue };
-            stats.record(&candidate, score.total() == first.len());
+            stats.record(&candidate, score.won(first.len()));
             tested.push((candidate, score));
         }
-        let winners = tested.iter().filter(|(_, s)| s.total() == first.len()).count();
-        if winners >= ENOUGH {
+        let perfect = tested.iter().filter(|(_, s)| s.total() == first.len()).count();
+        if perfect >= ENOUGH {
             break;
         }
     }
 
     let tried = tested.len();
-    let winners = tested.iter().filter(|(_, s)| s.total() == first.len()).count();
+    let winners = tested.iter().filter(|(_, s)| s.won(first.len())).count();
     let mut order: Vec<usize> = (0..tested.len()).filter(|i| tested[*i].1.total() > 0).collect();
     order.sort_by(|a, b| {
         let ((ca, sa), (cb, sb)) = (&tested[*a], &tested[*b]);
@@ -509,7 +519,8 @@ pub async fn search(job: &Job, progress: &(dyn Fn(View) + Send + Sync)) -> anyho
     }
 
     let fixed = hosts_of(&all, (0..all.len()).filter(|i| covered[*i]));
-    let unfixed = hosts_of(&job.hits, 0..job.hits.len()).into_iter().filter(|h| !fixed.contains(h)).collect();
+    // Only the sites the second round tried: the rest are not known to fail.
+    let unfixed = hosts_of(&all, 0..all.len()).into_iter().filter(|h| !fixed.contains(h)).collect();
     let recipes = chosen.into_iter().map(|i| recipes[ranked[i].0].clone()).collect();
     Ok(Found { recipes, fixed, unfixed, tried })
 }

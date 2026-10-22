@@ -1,7 +1,9 @@
 // The background: a dot-matrix screen computed on the CPU into one pixel buffer. Every cell is one
 // square dot, on or off, chosen by ordered (Bayer) dithering of a brightness map: the current service
 // logo shaded like a halftone print, slow clouds drifting behind it, a vignette at the edges.
-// Logos change by dissolving dot by dot, with a spark on every dot that flips.
+// Logos change with a burst: the old one flies apart in a spiral, a shock wave runs through the
+// clouds, and the new one gathers from the scatter, each dot flashing as it lands. The logo's dots
+// move out of the pointer's way and glow, then ease back; a click sends a ring through the logo.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -15,7 +17,12 @@ const PITCH: f32 = 4.0;
 const NOISE: usize = 64;
 const LEVELS: usize = 32;
 const BAYER: [f32; 16] = [0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0];
-const SPARK: f32 = 0.05;
+/// Where the logo sits, as a share of the height: the free band between the title and the buttons.
+const LOGO_Y: f32 = 0.71;
+/// How long a click's ring runs through the logo, in ms.
+pub const RING_MS: f64 = 1100.0;
+/// How fast a dot follows where it is pushed, in ms: the inertia that keeps the motion smooth.
+const SETTLE_MS: f32 = 90.0;
 
 /// A rectangle (device pixels) around text: dots that touch it stay dark.
 #[derive(Clone, Copy)]
@@ -26,8 +33,33 @@ pub struct Hole {
     pub y1: f32,
 }
 
+/// A click on the background, in device pixels and field time.
+#[derive(Clone, Copy)]
+pub struct Ripple {
+    pub x: f32,
+    pub y: f32,
+    pub at: f64,
+}
+
+/// What pushes the dots this frame: where from, how far it reaches, how hard.
+struct Force {
+    x: f32,
+    y: f32,
+    reach: f32,
+    push: f32,
+    /// Radius of a ring that runs outwards; None for a round push from the point itself.
+    ring: Option<f32>,
+}
+
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
 pub struct Frame<'a> {
     pub now: f64,
+    /// The pointer over the window, in device pixels.
+    pub pointer: Option<(f32, f32)>,
+    pub ripples: &'a [Ripple],
     pub shapes: &'a [&'static str],
     pub hot: bool,
     pub busy: bool,
@@ -45,6 +77,11 @@ pub struct Field {
     noise: Vec<f32>,
     seed: Vec<f32>,
     fade: Vec<f32>,
+    /// Where each dot is pushed from its place, device pixels; eases towards the push of this frame.
+    offset: Vec<(f32, f32)>,
+    last: f64,
+    /// Something moves (dots on their way, a logo changing): the caller gives frames at full rate.
+    pub stirred: bool,
     hidden: Vec<bool>,
     masks: HashMap<usize, Rc<Vec<f32>>>,
     from: Rc<Vec<f32>>,
@@ -126,6 +163,9 @@ impl Field {
             noise,
             seed,
             fade,
+            offset: vec![(0.0, 0.0); n],
+            last: 0.0,
+            stirred: false,
             hidden: vec![false; n],
             masks: HashMap::new(),
             from: empty.clone(),
@@ -202,8 +242,10 @@ impl Field {
         }
         let (cols, rows) = (self.cols, self.rows);
         let (w, h) = (self.w as f32, self.h as f32);
-        let size = (w * 0.86).min(h * 0.52);
-        let (cx, cy) = (w / 2.0, h * 0.5);
+        // The logo fills the free band between the title and the buttons: up top it would run under
+        // the dial and the title and come out cut in pieces.
+        let size = (w * 0.56).min(h * 0.34);
+        let (cx, cy) = (w / 2.0, h * LOGO_Y);
         let p = self.pitch as f32;
         let geometry = gfx.path(path);
         let core = gfx.raster(cols as u32, rows as u32, |rt, brush| unsafe {
@@ -237,7 +279,7 @@ impl Field {
             self.paint();
         }
         let hold = if f.busy { 2600.0 } else { 6000.0 };
-        let morph = if f.busy { 900.0 } else { 1400.0 };
+        let morph = if f.busy { 1300.0 } else { 1900.0 };
         if !f.shapes.is_empty() && (!self.started || f.now - self.since > hold + morph) {
             self.index = if self.started { (self.index + 1) % f.shapes.len() } else { 0 };
             self.from = self.to.clone();
@@ -248,7 +290,9 @@ impl Field {
                 self.started = true;
             }
         }
-        let p = (((f.now - self.since) / morph) as f32 * (1.0 + SPARK)).min(1.0 + SPARK);
+        let raw = ((f.now - self.since) / morph) as f32;
+        let moving = self.started && raw < 1.0;
+        let p = raw.clamp(0.0, 1.0);
         let secs = (f.now / 1000.0) as f32 * if f.busy { 1.8 } else { 1.0 };
         let (shape_gain, cloud_gain) = if f.quiet { (0.4, 0.55) } else { (1.0, 1.0) };
 
@@ -265,6 +309,27 @@ impl Field {
             }
         }
 
+        // Sizes in dips grow with the dots.
+        let u = p_px / PITCH;
+        let mut forces: Vec<Force> = Vec::new();
+        if let Some((x, y)) = f.pointer {
+            forces.push(Force { x, y, reach: 34.0 * u, push: 9.0 * u, ring: None });
+        }
+        for ripple in f.ripples {
+            let age = (f.now - ripple.at) as f32;
+            let k = 1.0 - age / RING_MS as f32;
+            if k > 0.0 {
+                forces.push(Force { x: ripple.x, y: ripple.y, reach: 14.0 * u, push: 8.0 * u * k, ring: Some(age * 0.3 * u) });
+            }
+        }
+        let dt = (f.now - self.last).clamp(0.0, 100.0) as f32;
+        self.last = f.now;
+        let follow = 1.0 - (-dt / SETTLE_MS).exp();
+        let mut stirred = moving;
+
+        let (lcx, lcy) = (self.w as f32 / 2.0, self.h as f32 * LOGO_Y);
+        let wave = ease_out(p) * (self.w as f32).hypot(self.h as f32) * 0.55;
+        let swirl = 1.1;
         let (from, to) = (self.from.clone(), self.to.clone());
         for r in 0..self.rows {
             let y = r as f32 / self.rows as f32;
@@ -274,30 +339,132 @@ impl Field {
                     self.fill(r, c, self.bg, false);
                     continue;
                 }
+                let (x0, y0) = (c as f32 * p_px, r as f32 * p_px);
+                let (mx, my) = (x0 + p_px / 2.0, y0 + p_px / 2.0);
                 let s = self.seed[i];
-                let shape = if p > s { to[i] } else { from[i] };
                 let cloud = self.sample(c as f32 * 0.085 + secs * 0.35, r as f32 * 0.085 + secs * 0.12) * 0.62
                     + self.sample(c as f32 * 0.2 - secs * 0.55, r as f32 * 0.2 + secs * 0.3) * 0.38;
-                let ambient = ((cloud - 0.42) * 1.7).clamp(0.0, 1.0) * 0.36 * cloud_gain;
+                let mut ambient = ((cloud - 0.42) * 1.7).clamp(0.0, 1.0) * 0.36 * cloud_gain;
                 // Inside a logo the shade falls off from the top and breathes with the clouds: a halftone print.
-                let ink = match shape {
-                    s if s >= 0.99 => 1.0,
-                    s if s >= 0.49 => {
-                        let grain = self.sample(c as f32 * 0.45 + secs * 0.2, r as f32 * 0.45 - secs * 0.15);
-                        (0.08 + 0.3 * (1.0 - y) + 0.6 * (cloud * 0.5 + grain * 0.5)).min(0.95)
-                    }
-                    s => s * 2.0,
-                } * shape_gain;
-                // Only dots that actually change between the two logos flash as they flip.
-                let flips = (to[i] - from[i]).abs() > 0.3;
-                let spark = if flips && (p - s).abs() < SPARK && p < 1.0 + SPARK { 1.0 } else { 0.0 };
-                let v = (ambient.max(ink) * self.fade[i]).max(spark * shape_gain);
+                let grain = self.sample(c as f32 * 0.45 + secs * 0.2, r as f32 * 0.45 - secs * 0.15);
+                let ink = |shape: f32| {
+                    shape_gain
+                        * match shape {
+                            s if s >= 0.99 => 1.0,
+                            s if s >= 0.49 => (0.08 + 0.3 * (1.0 - y) + 0.6 * (cloud * 0.5 + grain * 0.5)).min(0.95),
+                            s => s * 2.0,
+                        }
+                };
+                let (old, new) = (ink(from[i]), ink(to[i]));
                 let threshold = (BAYER[(r % 4) * 4 + c % 4] + 0.5) / 16.0;
-                if v > threshold {
-                    let level = ((v.min(1.0)) * (LEVELS - 1) as f32) as usize;
-                    self.fill(r, c, self.ramp[level], false);
+
+                // The shock wave of a change lights up the clouds as it passes.
+                let (ox, oy) = (mx - lcx, my - lcy);
+                let dist = ox.hypot(oy).max(1.0);
+                if moving {
+                    let band = (dist - wave) / (7.0 * p_px);
+                    ambient += 0.55 * (1.0 - p) * (-band * band).exp() * cloud_gain;
+                }
+
+                // Only the logo answers the pointer and click rings: its dots step aside, glow, and
+                // ease back. The clouds behind stay where they are.
+                let logo = old.max(new) > 0.05;
+                let (mut tx, mut ty, mut glow) = (0.0f32, 0.0f32, 0.0f32);
+                if logo {
+                    for force in &forces {
+                        let (fx, fy) = (mx - force.x, my - force.y);
+                        let d = fx.hypot(fy).max(0.5);
+                        let k = match force.ring {
+                            Some(radius) => (1.0 - (d - radius).abs() / force.reach).max(0.0),
+                            None => {
+                                let k = (1.0 - d / force.reach).max(0.0);
+                                k * k * (3.0 - 2.0 * k)
+                            }
+                        };
+                        if k > 0.0 {
+                            tx += fx / d * force.push * k;
+                            ty += fy / d * force.push * k;
+                            glow += k;
+                        }
+                    }
+                }
+                let (ex, ey) = self.offset[i];
+                let (dx, dy) = (ex + (tx - ex) * follow, ey + (ty - ey) * follow);
+                self.offset[i] = if dx.abs() + dy.abs() < 0.05 { (0.0, 0.0) } else { (dx, dy) };
+                stirred |= (dx - tx).abs() + (dy - ty).abs() > 0.2;
+                let glow = (glow.min(1.0) * 0.5).max((dx.hypot(dy) / (9.0 * u)).min(1.0) * 0.35);
+
+                // Dots both logos share stay put during a change; the rest fly.
+                let stay = if moving { old.min(new) } else { new };
+                let lit = if logo { stay + glow * stay.max(0.4) } else { 0.0 };
+                if logo && lit > ambient {
+                    let v = (lit * self.fade[i]).min(1.0);
+                    if v > threshold {
+                        self.put(x0 + dx, y0 + dy, self.ramp[(v * (LEVELS - 1) as f32) as usize]);
+                    }
+                } else {
+                    let v = (ambient.max(stay) * self.fade[i]).min(1.0);
+                    if v > threshold {
+                        self.fill(r, c, self.ramp[(v * (LEVELS - 1) as f32) as usize], false);
+                    }
+                }
+                if !moving {
+                    continue;
+                }
+                let (ux, uy) = (ox / dist, oy / dist);
+                let travel = (16.0 + 30.0 * s) * p_px;
+                let fly = |out: f32| {
+                    let a = swirl * out;
+                    let (rx, ry) = (ux * a.cos() - uy * a.sin(), ux * a.sin() + uy * a.cos());
+                    (x0 + rx * travel * out + dx, y0 + ry * travel * out + dy)
+                };
+                // The old logo bursts outwards in a spiral and fades on the way.
+                if old > stay + 0.05 {
+                    let t = ((p * 1.7 - s * 0.45) / 0.85).clamp(0.0, 1.0);
+                    if t < 1.0 {
+                        let flash = if t > 0.0 && t < 0.12 { 0.6 * shape_gain } else { 0.0 };
+                        let b = (old * (1.0 - t) * self.fade[i]).max(flash);
+                        if b > threshold {
+                            let (px, py) = fly(t * t);
+                            self.put(px, py, self.ramp[(b.min(1.0) * (LEVELS - 1) as f32) as usize]);
+                        }
+                    }
+                }
+                // The new one gathers from the scatter and flashes as each dot lands.
+                if new > stay + 0.05 {
+                    let t = ((p - 0.22 - s * 0.38) / 0.4).clamp(0.0, 1.0);
+                    if t > 0.0 {
+                        let e = ease_out(t);
+                        let flash = if t > 0.82 && t < 1.0 { shape_gain } else { 0.0 };
+                        let b = (new * (0.35 + 0.65 * e) * self.fade[i]).max(flash);
+                        if b > threshold {
+                            let (px, py) = fly(1.0 - e);
+                            self.put(px, py, self.ramp[(b.min(1.0) * (LEVELS - 1) as f32) as usize]);
+                        }
+                    }
                 }
             }
+        }
+        self.stirred = stirred;
+    }
+
+    /// A dot anywhere, not only on the grid: for dots on the move. Text holes stay clean.
+    fn put(&mut self, x: f32, y: f32, color: u32) {
+        let (x, y) = (x.round(), y.round());
+        if x < 0.0 || y < 0.0 {
+            return;
+        }
+        let (x0, y0) = (x as usize, y as usize);
+        if x0 >= self.w || y0 >= self.h {
+            return;
+        }
+        let (c, r) = ((x0 + self.dot / 2) / self.pitch, (y0 + self.dot / 2) / self.pitch);
+        if c < self.cols && r < self.rows && self.hidden[r * self.cols + c] {
+            return;
+        }
+        let x1 = (x0 + self.dot).min(self.w);
+        for y in y0..(y0 + self.dot).min(self.h) {
+            self.pixels[y * self.w + x0..y * self.w + x1].fill(color);
         }
     }
 }

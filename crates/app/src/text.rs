@@ -9,17 +9,6 @@ pub enum Tone {
     Mute,
 }
 
-pub fn plural<'a>(n: usize, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
-    let (d, h) = (n % 10, n % 100);
-    if d == 1 && h != 11 {
-        one
-    } else if (2..=4).contains(&d) && !(12..=14).contains(&h) {
-        few
-    } else {
-        many
-    }
-}
-
 pub fn phase(phase: Phase) -> &'static str {
     match phase {
         Phase::Probing => "Смотрю, что режет провайдер",
@@ -28,6 +17,12 @@ pub fn phase(phase: Phase) -> &'static str {
         Phase::Done => "Готово, запомнил для этой сети",
         Phase::Failed => "Настройка остановлена",
     }
+}
+
+/// Services going through the bypass. Games without their own domains share their launcher's row
+/// and are not counted twice.
+pub fn bypassed(status: &Status) -> usize {
+    status.sites.iter().filter(|s| !s.id.starts_with("game:")).filter(|s| s.state == SiteState::Bypassed).count()
 }
 
 pub struct View {
@@ -57,11 +52,9 @@ pub fn view(connected: bool, missing: bool, stopped: bool, launching: bool, stat
     let message = || status.message.clone();
     match status.state {
         State::Working => {
-            // Games without their own domains share their launcher's row and are not counted twice.
-            let own = |s: &&SiteStatus| !s.id.starts_with("game:");
-            let n = status.sites.iter().filter(own).filter(|s| s.state == SiteState::Bypassed).count();
-            let sub = if n > 0 {
-                format!("Через обход {} {n} {}", plural(n, "идёт", "идут", "идут"), plural(n, "сервис", "сервиса", "сервисов"))
+            // How many services go through the bypass is on the badge of the "Services" button.
+            let sub = if bypassed(status) > 0 {
+                String::new()
             } else if status.sites.iter().any(|s| s.state == SiteState::Checking) {
                 "Проверяю, что режет провайдер".into()
             } else {
@@ -108,6 +101,7 @@ pub fn update(update: &Update) -> (String, Tone) {
 
 pub fn site_short(site: &SiteStatus, learning: bool) -> (&'static str, Tone) {
     match site.state {
+        SiteState::Bypassed if site.mode == SiteMode::Always => ("всегда обход", Tone::Ok),
         SiteState::Bypassed => ("через обход", Tone::Ok),
         SiteState::Direct if site.mode == SiteMode::Never => ("всегда напрямую", Tone::Mute),
         SiteState::Direct => ("напрямую", Tone::Mute),
