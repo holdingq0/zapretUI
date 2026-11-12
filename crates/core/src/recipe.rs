@@ -323,3 +323,48 @@ impl Recipe {
         self.actions.iter().map(Action::label).collect::<Vec<_>>().join(" + ")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_recipe_becomes_winws2_arguments() {
+        let recipe = Recipe {
+            payload: Payload::TlsClientHello,
+            actions: vec![
+                Action::Fake {
+                    blob: Blob::DefaultTls,
+                    fooling: vec![Fooling::Ts(-1000)],
+                    repeats: 6,
+                    tls_mod: vec![TlsMod::Rnd, TlsMod::DupSid],
+                },
+                Action::Multidisorder { pos: "midsld".into(), seqovl: None },
+            ],
+        };
+        assert_eq!(
+            recipe.args(),
+            [
+                "--payload=tls_client_hello",
+                "--lua-desync=fake:blob=fake_default_tls:tcp_ts=-1000:tls_mod=rnd,dupsid:repeats=6",
+                "--lua-desync=multidisorder:pos=midsld",
+            ]
+        );
+        assert!(recipe.is_safe());
+        assert_eq!(recipe.cost(), 2 + 6 + 1);
+    }
+
+    #[test]
+    fn a_recipe_with_a_smuggled_argument_is_not_safe() {
+        let recipe = Recipe {
+            payload: Payload::TlsClientHello,
+            actions: vec![Action::Hostfakesplit { host: Some("a.com --debug=@x".into()), fooling: vec![], repeats: 1 }],
+        };
+        assert!(!recipe.is_safe());
+        let autottl = Recipe {
+            payload: Payload::HttpReq,
+            actions: vec![Action::Fakedsplit { pos: "method+2".into(), fooling: vec![Fooling::AutoTtl { delta: 2, min: 3, max: 20 }], repeats: 1 }],
+        };
+        assert!(autottl.is_safe());
+    }
+}

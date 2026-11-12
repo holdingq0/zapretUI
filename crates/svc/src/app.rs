@@ -12,6 +12,10 @@ pub async fn run(shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
     let hub = tokio::task::spawn_blocking(move || Arc::new(Hub::new(jobs_tx, verify_tx, update_tx))).await?;
     {
         let hub = hub.clone();
+        std::thread::Builder::new().name("engine".into()).spawn(move || hub.run_engine())?;
+    }
+    {
+        let hub = hub.clone();
         tokio::task::spawn_blocking(move || hub.apply()).await?;
     }
     let mut server = tokio::spawn(pipe::serve(hub.clone()));

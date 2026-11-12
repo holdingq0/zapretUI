@@ -2,6 +2,17 @@
 /resources/winws2/*
 !/resources/winws2/SHA256SUMS
 !/resources/winws2/VERSION
-*.log
 !/resources/winws2/LICENSE-zapret2.txt
+*.log
 /PLAN.md
+/notes.md
+release.key
+
+# Editors and OS
+.vscode/
+.idea/
+.claude/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

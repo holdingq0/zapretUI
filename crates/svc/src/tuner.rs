@@ -18,6 +18,7 @@ const MAX_TARGETS: usize = 40;
 const RECHECKS: usize = 2;
 const RECHECK_DELAY: Duration = Duration::from_secs(5);
 const VERIFY_RETRY: Duration = Duration::from_secs(3);
+const ENGINE_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Job {
@@ -64,6 +65,7 @@ pub async fn run(hub: Arc<Hub>, mut jobs: mpsc::UnboundedReceiver<Job>) {
         match job {
             Job::Learn => learn(&hub).await,
             Job::Check => {
+                engine_settled(&hub).await;
                 if let Some(extra) = hub.begin_check() {
                     let probes = probe_all(targets_for(&extra, false), false, rkn_search::probe_opts(), &mut |_, _| {}).await;
                     let suspects = hub.finish_check(probes);
@@ -73,6 +75,15 @@ pub async fn run(hub: Arc<Hub>, mut jobs: mpsc::UnboundedReceiver<Job>) {
                 }
             }
         }
+    }
+}
+
+/// A check judges the bypass by probing through it. winws2 is started by its own thread, and a check
+/// right after a change of settings would otherwise probe while it is still coming up.
+async fn engine_settled(hub: &Hub) {
+    let deadline = Instant::now() + ENGINE_WAIT;
+    while !hub.engine_settled() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -251,7 +262,8 @@ async fn learn_with(hub: &Hub, ctx: &LearnCtx) -> Learned {
     let targets = targets_for(&ctx.extra, true);
     let total = targets.len();
     let probes = probe_all(targets, true, rkn_search::probe_opts(), &mut |probe, done| {
-        let line = if probe.control { None } else { diagnosis(probe) };
+        // Hostings are probed in the background: no lines about them in the window.
+        let line = if probe.control || targets::background(&probe.target.host) { None } else { diagnosis(probe) };
         hub.learn_probed(line, done, total);
     })
     .await;

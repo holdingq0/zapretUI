@@ -143,3 +143,48 @@ impl Plan {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rkn_core::recipe::{Action, Payload};
+
+    use super::*;
+
+    fn split(pos: &str) -> Recipe {
+        Recipe { payload: Payload::TlsClientHello, actions: vec![Action::Multisplit { pos: pos.into(), seqovl: None, seqovl_pattern: None }] }
+    }
+
+    fn profile(name: &str, recipes: Vec<Recipe>) -> Profile {
+        Profile {
+            name: name.into(),
+            proto: Proto::Tcp,
+            filter: Filter { ports: "443".into(), l7: vec!["tls".into()], ..Filter::default() },
+            recipes,
+        }
+    }
+
+    #[test]
+    fn one_recipe_goes_in_as_it_is() {
+        let plan = Plan { wf_tcp_out: "443".into(), profiles: vec![profile("tls", vec![split("2")])], ..Plan::default() };
+        assert_eq!(
+            plan.args(),
+            ["--wf-tcp-out=443", "--name=tls", "--filter-tcp=443", "--filter-l7=tls", "--payload=tls_client_hello", "--lua-desync=multisplit:pos=2"]
+        );
+    }
+
+    #[test]
+    fn several_recipes_go_under_the_circular_orchestrator() {
+        let plan = Plan {
+            wf_tcp_out: "443".into(),
+            profiles: vec![profile("tls", vec![split("2"), split("1")]), profile("other", vec![split("midsld")])],
+            ..Plan::default()
+        };
+        let args = plan.args();
+        let at = |arg: &str| args.iter().position(|a| a == arg).unwrap_or_else(|| panic!("no {arg} in {args:?}"));
+        assert!(at("--lua-desync=circular") < at("--lua-desync=multisplit:pos=2:strategy=1"));
+        assert!(at("--lua-desync=multisplit:pos=2:strategy=1") < at("--lua-desync=multisplit:pos=1:strategy=2"));
+        // The second profile starts with --new and its single recipe has no strategy number.
+        assert!(at("--new=other") < at("--lua-desync=multisplit:pos=midsld"));
+        assert_eq!(args.iter().filter(|a| a.starts_with("--name=")).count(), 1);
+    }
+}

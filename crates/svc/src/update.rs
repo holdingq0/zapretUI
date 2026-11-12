@@ -13,7 +13,6 @@ use rkn_core::ipc::{Level, UpdateState};
 use rkn_core::paths;
 use rkn_core::release::{FileEntry, Manifest, Place, attached, setup_asset, split, unhex, unpack};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use windows::Win32::Networking::WinHttp::{
     WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ADDREQ_FLAG_ADD, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
@@ -50,13 +49,18 @@ fn marker() -> PathBuf {
 struct Source {
     repo: String,
     key: String,
+    #[serde(default)]
+    accept: Vec<String>,
 }
 
-fn source() -> Option<(String, Vec<u8>)> {
+/// The repository and every key an update may be signed with: the current one first, then the
+/// ones listed for a change of key.
+fn source() -> Option<(String, Vec<Vec<u8>>)> {
     let source: Source = toml::from_str(RELEASE).ok()?;
-    let key = unhex(&source.key).filter(|k| k.len() == 32)?;
+    let mut keys = vec![unhex(&source.key).filter(|k| k.len() == 32)?];
+    keys.extend(source.accept.iter().filter_map(|k| unhex(k)).filter(|k| k.len() == 32));
     let repo = source.repo.trim();
-    (repo.split('/').count() == 2 && !repo.starts_with('/') && !repo.ends_with('/')).then(|| (repo.to_string(), key))
+    (repo.split('/').count() == 2 && !repo.starts_with('/') && !repo.ends_with('/')).then(|| (repo.to_string(), keys))
 }
 
 pub fn enabled() -> bool {
@@ -172,7 +176,7 @@ fn get(url: &str, accept: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    rkn_core::release::hex(&Sha256::digest(bytes))
+    rkn_core::release::hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
 fn sha256_file(path: &Path) -> Option<String> {
@@ -204,14 +208,15 @@ fn latest(repo: &str) -> anyhow::Result<Option<Release>> {
 }
 
 /// Downloads and checks everything the release changes; returns the files to put in place.
-fn download(release: &Release, key: &[u8]) -> anyhow::Result<Vec<(FileEntry, PathBuf)>> {
+fn download(release: &Release, keys: &[Vec<u8>]) -> anyhow::Result<Vec<(FileEntry, PathBuf)>> {
     // The new version comes inside its installer.
     let asset = release.asset(&setup_asset(release.version()))?;
     let bytes = get(&asset.browser_download_url, "application/octet-stream", MAX_UPDATE)?;
     let (manifest_bytes, signature, body) = attached(&bytes).and_then(unpack).context("установщик новой версии повреждён")?;
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
-        .verify(manifest_bytes, signature)
-        .map_err(|_| anyhow!("подпись обновления не совпадает, обновление отклонено"))?;
+    let signed = keys.iter().any(|key| {
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key).verify(manifest_bytes, signature).is_ok()
+    });
+    ensure!(signed, "подпись обновления не совпадает, обновление отклонено");
     let manifest: Manifest = serde_json::from_slice(manifest_bytes).context("список файлов обновления")?;
     ensure!(manifest.version == release.version(), "версия в обновлении не совпадает с релизом");
     ensure!(paths::newer(&manifest.version, env!("CARGO_PKG_VERSION")), "релиз не новее установленной версии");
@@ -388,10 +393,10 @@ async fn check(hub: &Hub, repo: &str) -> Option<Release> {
     }
 }
 
-async fn install(hub: &Hub, release: Release, key: Vec<u8>) {
+async fn install(hub: &Hub, release: Release, keys: Vec<Vec<u8>>) {
     let version = release.version().to_string();
     hub.set_update(UpdateState::Downloading, Some(version.clone()), None);
-    let files = match blocking(move || download(&release, &key)).await {
+    let files = match blocking(move || download(&release, &keys)).await {
         Ok(files) => files,
         Err(e) => {
             tracing::warn!("update download: {e:#}");
@@ -400,7 +405,8 @@ async fn install(hub: &Hub, release: Release, key: Vec<u8>) {
         }
     };
     hub.set_update(UpdateState::Installing, Some(version.clone()), None);
-    hub.stop_for_update();
+    // Waits for winws2 to exit, and for a start that was under way: not on a bare worker thread.
+    tokio::task::block_in_place(|| hub.stop_for_update());
     // Trial winws2 of a stopped search must be gone before their files are replaced and the driver goes.
     tokio::time::sleep(Duration::from_millis(300)).await;
     rkn_search::settle().await;
@@ -441,7 +447,7 @@ pub async fn run(hub: Arc<Hub>, mut asks: mpsc::UnboundedReceiver<Ask>) {
             hub.note(Level::Info, format!("zapretUI обновлён до версии {}", version.trim()));
         }
     }
-    let Some((repo, key)) = source() else {
+    let Some((repo, keys)) = source() else {
         while asks.recv().await.is_some() {}
         return;
     };
@@ -462,7 +468,7 @@ pub async fn run(hub: Arc<Hub>, mut asks: mpsc::UnboundedReceiver<Ask>) {
                     found = check(&hub, &repo).await;
                 }
                 if let Some(release) = found.take() {
-                    install(&hub, release, key.clone()).await;
+                    install(&hub, release, keys.clone()).await;
                 }
             }
             // A manual check only shows what is there; installing stays one more click away.
@@ -473,7 +479,7 @@ pub async fn run(hub: Arc<Hub>, mut asks: mpsc::UnboundedReceiver<Ask>) {
                 let Some(release) = found.take() else { continue };
                 let rolled_back = std::fs::read_to_string(skipped()).is_ok_and(|v| v.trim() == release.version());
                 if hub.auto_update() && !hub.busy() && !rolled_back {
-                    install(&hub, release, key.clone()).await;
+                    install(&hub, release, keys.clone()).await;
                     continue;
                 }
                 // Without auto updates the badge in the window and the tray menu offer it.

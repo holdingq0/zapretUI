@@ -3,8 +3,11 @@ name = "YouTube"
 domains = ["youtube.com", "googlevideo.com", "ytimg.com", "ggpht.com", "youtu.be", "youtube-nocookie.com", "youtubei.googleapis.com", "youtubekids.com", "yt.be"]
 probe = ["www.youtube.com"]
 
+# always: goes through the bypass on every network. Discord's site may open while its calls and
+# updates are cut, and those cannot be probed without an account.
 [[service]]
 name = "Discord"
+always = true
 domains = ["discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discord.media", "discordcdn.com", "discord.dev", "discord.new", "discord.gift", "discordstatus.com", "dis.gd"]
 probe = ["discord.com", "gateway.discord.gg"]
 
@@ -45,6 +48,7 @@ domains = ["soundcloud.com", "sndcdn.com"]
 
 # Hostings where DPI cuts connections at 16-20 KB: the probe downloads a big file, and once it is
 # cut, all of the hosting's subnets (resources/ipset-hosting.txt) go through the bypass.
+# They work in the background: the window lists only the services people know by name.
 [[service]]
 name = "Сайты на Linode"
 domains = ["linode.com"]

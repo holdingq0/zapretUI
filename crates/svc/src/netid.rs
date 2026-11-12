@@ -27,10 +27,12 @@ impl Network {
     }
 }
 
-pub fn current() -> Option<Network> {
+/// The network the computer is on. With several connected at once (a VPN over Wi-Fi) the answer
+/// must not depend on the order Windows lists them in: see `choose`.
+pub fn current(prefer: Option<&str>) -> Option<Network> {
     let found = unsafe {
         let init = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let found = query();
+        let found = query().map(|all| choose(all, prefer));
         if init.is_ok() {
             CoUninitialize();
         }
@@ -42,12 +44,27 @@ pub fn current() -> Option<Network> {
     })
 }
 
-unsafe fn query() -> windows::core::Result<Option<Network>> {
+/// Networks with internet come first. Among them a physical link (Wi-Fi, cable) wins over a
+/// tunnel: the provider behind the physical link is what the strategy is learned for. `prefer` is the
+/// network in use now, kept while it is still as good as the others.
+fn choose(all: Vec<Network>, prefer: Option<&str>) -> Option<Network> {
+    let rank = |n: &Network| (n.internet, n.link != Link::Other, prefer == Some(n.id.as_str()));
+    let mut best: Option<Network> = None;
+    for network in all {
+        // Strictly better only: of equals the first one listed stays.
+        if best.as_ref().is_none_or(|b| rank(&network) > rank(b)) {
+            best = Some(network);
+        }
+    }
+    best
+}
+
+unsafe fn query() -> windows::core::Result<Vec<Network>> {
     unsafe {
         let manager: INetworkListManager = CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL)?;
         let networks: IEnumNetworks = manager.GetNetworks(NLM_ENUM_NETWORK_CONNECTED)?;
         let internet = NLM_CONNECTIVITY_IPV4_INTERNET.0 | NLM_CONNECTIVITY_IPV6_INTERNET.0;
-        let mut fallback: Option<Network> = None;
+        let mut all: Vec<Network> = Vec::new();
         loop {
             let mut item = [None];
             let mut fetched = 0u32;
@@ -62,13 +79,9 @@ unsafe fn query() -> windows::core::Result<Option<Network>> {
                 .collect::<String>()
                 .to_ascii_lowercase();
             let online = network.GetConnectivity()?.0 & internet != 0;
-            let found = Network { id, name: network.GetName()?.to_string(), link: link_of(&network), internet: online };
-            if online {
-                return Ok(Some(found));
-            }
-            fallback.get_or_insert(found);
+            all.push(Network { id, name: network.GetName()?.to_string(), link: link_of(&network), internet: online });
         }
-        Ok(fallback)
+        Ok(all)
     }
 }
 
@@ -129,5 +142,42 @@ unsafe fn adapter_types() -> Vec<(String, u32)> {
         }
         drop(buf);
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn net(id: &str, link: Link, internet: bool) -> Network {
+        Network { id: id.into(), name: id.into(), link, internet }
+    }
+
+    fn chosen(all: Vec<Network>, prefer: Option<&str>) -> Option<String> {
+        choose(all, prefer).map(|n| n.id)
+    }
+
+    #[test]
+    fn a_physical_link_wins_over_a_tunnel_in_any_order() {
+        let (vpn, wifi) = (net("vpn", Link::Other, true), net("wifi", Link::Wifi, true));
+        assert_eq!(chosen(vec![vpn.clone(), wifi.clone()], None).as_deref(), Some("wifi"));
+        assert_eq!(chosen(vec![wifi.clone(), vpn.clone()], None).as_deref(), Some("wifi"));
+        assert_eq!(chosen(vec![vpn, wifi], Some("vpn")).as_deref(), Some("wifi"));
+    }
+
+    #[test]
+    fn of_equal_networks_the_current_one_stays() {
+        let all = || vec![net("cable", Link::Ethernet, true), net("wifi", Link::Wifi, true)];
+        assert_eq!(chosen(all(), None).as_deref(), Some("cable"));
+        assert_eq!(chosen(all(), Some("wifi")).as_deref(), Some("wifi"));
+        assert_eq!(chosen(all(), Some("gone")).as_deref(), Some("cable"));
+    }
+
+    #[test]
+    fn internet_matters_most() {
+        let all = vec![net("wifi", Link::Wifi, false), net("modem", Link::Other, true)];
+        assert_eq!(chosen(all, Some("wifi")).as_deref(), Some("modem"));
+        assert_eq!(chosen(vec![net("wifi", Link::Wifi, false)], None).as_deref(), Some("wifi"));
+        assert_eq!(chosen(Vec::new(), None), None);
     }
 }

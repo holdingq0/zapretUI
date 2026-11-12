@@ -74,3 +74,23 @@ pub fn normalize_host(input: &str) -> Option<String> {
         });
     ok.then(|| s.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_host;
+
+    #[test]
+    fn takes_the_host_out_of_an_address() {
+        assert_eq!(normalize_host("https://www.YouTube.com/watch?v=1").as_deref(), Some("youtube.com"));
+        assert_eq!(normalize_host("user@example.org:8080/path").as_deref(), Some("example.org"));
+        assert_eq!(normalize_host("  example.com.  ").as_deref(), Some("example.com"));
+        assert_eq!(normalize_host("sub.example.co.uk#top").as_deref(), Some("sub.example.co.uk"));
+    }
+
+    #[test]
+    fn refuses_what_is_not_a_host() {
+        for bad in ["", "localhost", "-bad.com", "bad-.com", "a..b", "exa mple.com", "пример.рф", "a.com;rm"] {
+            assert_eq!(normalize_host(bad), None, "{bad}");
+        }
+    }
+}

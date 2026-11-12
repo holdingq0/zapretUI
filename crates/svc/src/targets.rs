@@ -48,6 +48,9 @@ pub struct Service {
     /// every site on these addresses goes through the bypass, not only the probed host.
     #[serde(default)]
     pub ipset: Option<String>,
+    /// Goes through the bypass on every network, whatever the probe says.
+    #[serde(default)]
+    pub always: bool,
 }
 
 impl Service {
@@ -69,6 +72,16 @@ impl Service {
 
 pub fn by_name(name: &str) -> Option<&'static Service> {
     catalog().service.iter().find(|s| s.name == name)
+}
+
+/// A service that is always bypassed owns this host.
+pub fn forced(host: &str) -> bool {
+    catalog().service.iter().filter(|s| s.always).any(|s| s.domains.iter().any(|d| within(host, d)))
+}
+
+/// Not a row in the window: a hosting whose subnets are watched in the background.
+pub fn background(host: &str) -> bool {
+    service_of(host).is_some_and(|s| s.ipset.is_some())
 }
 
 pub fn games() -> impl Iterator<Item = &'static Service> {
@@ -179,4 +192,67 @@ pub fn hosting_ipset(blocked: &[String]) -> Vec<String> {
         .filter(|(name, _)| names.contains(name))
         .map(|(_, net)| net.trim().to_owned())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_catalog_reads_and_holds_together() {
+        let catalog = catalog();
+        assert!(!catalog.service.is_empty() && !catalog.control.is_empty());
+        let mut ids: Vec<String> = catalog.service.iter().map(Service::id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), catalog.service.len(), "two services share an id");
+        for service in &catalog.service {
+            if let Some(launcher) = &service.launcher {
+                assert!(by_name(launcher).is_some(), "{}: no launcher {launcher}", service.name);
+            }
+            if service.ipset.is_some() {
+                let id = service.id();
+                assert!(!hosting_ipset(std::slice::from_ref(&id)).is_empty(), "{}: no subnets", service.name);
+            }
+            for host in service.probe.iter().chain(&service.probe_http) {
+                assert_eq!(service_of(host).map(|s| &s.name), Some(&service.name), "{host}");
+            }
+        }
+        assert!(hosting_ipset(&[]).is_empty());
+        assert!(hosting_ipset(&["youtube.com".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn a_host_belongs_to_its_service() {
+        assert_eq!(service_of("www.youtube.com").map(|s| s.name.as_str()), Some("YouTube"));
+        assert_eq!(service_of("rr1---sn-abc.googlevideo.com").map(|s| s.name.as_str()), Some("YouTube"));
+        assert!(service_of("notyoutube.com").is_none());
+        assert!(service_of("example.org").is_none());
+        assert!(within("a.b.com", "b.com") && within("b.com", "b.com"));
+        assert!(!within("ab.com", "b.com"));
+    }
+
+    #[test]
+    fn the_bypass_takes_a_whole_service_but_only_one_foreign_host() {
+        assert!(expand("discord.gg").contains(&"discord.com".to_string()));
+        assert_eq!(expand("play.google.com"), ["play.google.com"]);
+        assert_eq!(group("cdn.discordapp.com").name, "Discord");
+        assert_eq!(group("a.b.example.com").id, "example.com");
+    }
+
+    #[test]
+    fn discord_is_always_bypassed_and_hostings_stay_in_the_background() {
+        assert!(forced("discord.com") && forced("gateway.discord.gg") && forced("cdn.discordapp.com"));
+        assert!(!forced("youtube.com") && !forced("example.org"));
+        assert!(background("proof.ovh.net") && background("nbg1-speed.hetzner.com"));
+        assert!(!background("discord.com") && !background("example.org"));
+    }
+
+    #[test]
+    fn base_domains() {
+        assert_eq!(base_domain("a.b.example.com"), "example.com");
+        assert_eq!(base_domain("example.com"), "example.com");
+        assert_eq!(base_domain("www.bbc.co.uk"), "bbc.co.uk");
+        assert_eq!(base_domain("shop.example.com.tr"), "example.com.tr");
+    }
 }

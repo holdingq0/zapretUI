@@ -78,7 +78,7 @@ async fn doh(host: &str) -> Option<Vec<IpAddr>> {
 async fn doh_one(name: &str, server: Ipv4Addr, host: &str) -> Option<Vec<IpAddr>> {
     let exchange = async {
         let tcp = net::connect(IpAddr::V4(server), 443, None, Duration::from_secs(3)).await.ok()?;
-        let mut stream = tls::handshake(tcp, name, Duration::from_secs(3)).await.ok()?;
+        let mut stream = tls::handshake(tcp, name, Duration::from_secs(3), tls::Hello::Small).await.ok()?;
         let body = query(host)?;
         let head = format!(
             "POST /dns-query HTTP/1.1\r\nHost: {name}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -153,4 +153,50 @@ fn parse_a(buf: &[u8]) -> Option<Vec<IpAddr>> {
         pos += 10 + len;
     }
     Some(ips)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_an_a_query() {
+        let parts: [&[u8]; 3] = [&[0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0], b"\x02ya\x02ru", &[0, 0, 1, 0, 1]];
+        let expected = parts.concat();
+        assert_eq!(query("ya.ru"), Some(expected.clone()));
+        assert_eq!(query("ya.ru."), Some(expected));
+        assert_eq!(query("a..b"), None);
+    }
+
+    fn answer(rcode: u8) -> Vec<u8> {
+        let mut buf = vec![0, 0, 0x81, 0x80 | rcode, 0, 1, 0, 2, 0, 0, 0, 0];
+        buf.extend_from_slice(b"\x02ya\x02ru\x00\x00\x01\x00\x01");
+        // A CNAME first, the way big services answer, then the address.
+        buf.extend_from_slice(&[0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 1, 0, 2, 0xc0, 0x0c]);
+        buf.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 1, 2, 3, 4]);
+        buf
+    }
+
+    #[test]
+    fn reads_addresses_past_a_cname() {
+        assert_eq!(parse_a(&answer(0)), Some(vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]));
+    }
+
+    #[test]
+    fn tells_no_such_name_from_a_failed_server() {
+        assert_eq!(parse_a(&answer(3)), Some(Vec::new()));
+        assert_eq!(parse_a(&answer(2)), None);
+        let whole = answer(0);
+        assert_eq!(parse_a(&whole[..whole.len() - 2]), None, "cut short");
+    }
+
+    #[test]
+    fn private_and_reserved_addresses_are_not_global() {
+        let global = |s: &str| is_global(&s.parse().unwrap());
+        assert!(global("8.8.8.8"));
+        assert!(global("2606:4700::1111"));
+        for local in ["192.168.1.1", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.1.1", "0.0.0.0", "240.0.0.1", "::1", "fd00::1"] {
+            assert!(!global(local), "{local}");
+        }
+    }
 }

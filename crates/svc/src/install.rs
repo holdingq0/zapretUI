@@ -295,8 +295,11 @@ pub fn uninstall(args: &[String]) -> anyhow::Result<()> {
         }
     }
     let me = std::env::current_exe()?;
-    if me.starts_with(std::env::temp_dir()) {
+    if me.file_name().is_some_and(|n| n == system::UNINSTALLER) {
         system::delete_later(&me);
+        if let Some(dir) = me.parent() {
+            system::delete_later(dir);
+        }
     }
     if args.iter().any(|a| a == "--ui") {
         system::message("zapretUI удалён");

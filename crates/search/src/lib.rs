@@ -20,7 +20,8 @@ pub use generate::{Candidate, Class, candidates};
 pub use priors::Priors;
 
 pub const RESERVED_PORTS: (u16, u16) = (40000, 47999);
-const BLOCK: u16 = 32;
+/// Local ports one trial owns. Every probe of a trial is its own connection from its own port.
+const BLOCK: u16 = 128;
 const BATCH: usize = 40;
 const PARALLEL: usize = 4;
 const MAX_BATCHES: usize = 5;
@@ -31,6 +32,11 @@ const ROUND1_HITS: usize = 3;
 const ROUND2_HITS: usize = 12;
 const ROUND2_REPEATS: usize = 3;
 const BUDGET: Duration = Duration::from_secs(240);
+
+// The second round opens every connection at once: a block smaller than that would fail the last
+// probes on a busy local port and report their sites as not fixed.
+// Each probe is up to two connections, one per size of ClientHello.
+const _: () = assert!(BLOCK as usize >= 2 * ROUND2_HITS * ROUND2_REPEATS);
 
 static NEXT_BLOCK: AtomicU32 = AtomicU32::new(u32::MAX);
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -76,7 +82,7 @@ pub fn port_block() -> PortBlock {
 }
 
 pub fn probe_opts() -> Opts {
-    Opts { connect: Duration::from_secs(3), idle: Duration::from_millis(2500), want: 48 * 1024 }
+    Opts { connect: Duration::from_secs(3), idle: Duration::from_millis(2500), want: 48 * 1024, hello: rkn_probe::Hello::Small }
 }
 
 #[derive(Debug, Clone)]
@@ -217,7 +223,7 @@ async fn trial(dir: PathBuf, class: Class, recipe: Recipe, hits: Arc<Vec<Hit>>, 
         for _ in 0..repeats {
             let hit = hit.clone();
             let block = block.clone();
-            set.spawn(async move { (i, rkn_probe::fetch(&hit.target, hit.ip, Some(&block), probe_opts()).await) });
+            set.spawn(async move { (i, rkn_probe::fetch_both(&hit.target, hit.ip, Some(&block), probe_opts()).await) });
         }
     }
     let mut score = Score { passed: vec![0; hits.len()], attempts: 0, latency_sum: 0 };
@@ -551,5 +557,81 @@ fn sites_word(n: usize) -> &'static str {
     match (n % 10, n % 100) {
         (1, h) if h != 11 => "сайте",
         _ => "сайтах",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn every_candidate_is_distinct_and_safe_to_pass_to_winws2() {
+        for class in [Class::Tls, Class::Http] {
+            let pool = candidates(class, &Priors::builtin());
+            assert!(pool.len() > 100, "{class:?}: {}", pool.len());
+            let distinct: HashSet<&Recipe> = pool.iter().map(|c| &c.recipe).collect();
+            assert_eq!(distinct.len(), pool.len());
+            for candidate in &pool {
+                assert!(candidate.recipe.is_safe(), "{:?}", candidate.recipe.args());
+                assert!(candidate.prior.is_finite() && candidate.prior > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_port_block_fits_the_second_round_and_the_reserved_range() {
+        for _ in 0..300 {
+            let block = port_block();
+            assert!(block.lo() >= RESERVED_PORTS.0 && block.hi() <= RESERVED_PORTS.1);
+            assert_eq!(usize::from(block.hi() - block.lo()) + 1, usize::from(BLOCK));
+        }
+    }
+
+    #[test]
+    fn the_first_round_forgives_one_miss_out_of_three() {
+        let score = |passed: &[usize]| Score { passed: passed.to_vec(), attempts: passed.len(), latency_sum: 0 };
+        assert!(score(&[1, 1, 1]).won(3));
+        assert!(score(&[1, 1, 0]).won(3));
+        assert!(!score(&[1, 0, 0]).won(3));
+        assert!(score(&[1, 1]).won(2));
+        assert!(!score(&[1, 0]).won(2));
+    }
+
+    #[test]
+    fn a_batch_is_taken_out_of_the_pool_and_mixes_families() {
+        let mut pool = candidates(Class::Tls, &Priors::builtin());
+        let before = pool.len();
+        let batch = pick(&mut pool, &Stats::default(), BATCH);
+        assert_eq!(batch.len(), BATCH);
+        assert_eq!(pool.len(), before - BATCH);
+        let picked: HashSet<&Recipe> = batch.iter().map(|c| &c.recipe).collect();
+        assert_eq!(picked.len(), BATCH);
+        assert!(pool.iter().all(|c| !picked.contains(&c.recipe)));
+        let groups: HashSet<&str> = batch.iter().map(|c| c.group.as_str()).collect();
+        assert!(groups.len() >= 5, "{groups:?}");
+    }
+
+    #[test]
+    fn old_strategies_lead_the_first_batch() {
+        let mut pool = candidates(Class::Tls, &Priors::builtin());
+        let known = pool[pool.len() / 2].recipe.clone();
+        seed(&mut pool, std::slice::from_ref(&known));
+        let batch = pick(&mut pool, &Stats::default(), BATCH);
+        assert_eq!(batch[0].recipe, known);
+    }
+
+    #[test]
+    fn the_first_round_takes_catalog_sites_with_different_blocks() {
+        let hit = |host: &str, verdict, core| Hit { target: Target::https(host), ip: IpAddr::from([1, 1, 1, 1]), verdict, core };
+        let hits = [
+            hit("found.example", Verdict::TlsBlocked, false),
+            hit("b.example", Verdict::TlsBlocked, true),
+            hit("c.example", Verdict::Cut, true),
+            hit("d.example", Verdict::TlsBlocked, true),
+        ];
+        let hosts: Vec<String> = round1_hits(&hits).into_iter().map(|h| h.target.host).collect();
+        assert_eq!(hosts, ["b.example", "c.example", "d.example"]);
     }
 }

@@ -155,3 +155,50 @@ pub fn body(raw: &[u8]) -> Option<(u16, Vec<u8>)> {
         pos += size + 2;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_by_length_and_by_chunks() {
+        let plain = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcdef";
+        assert_eq!(body(plain), Some((200, b"abc".to_vec())));
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;x=1\r\nde\r\n0\r\n\r\n";
+        assert_eq!(body(chunked), Some((200, b"abcde".to_vec())));
+        assert_eq!(body(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab"), None);
+        assert_eq!(body(b"no head here"), None);
+    }
+
+    async fn fetch_from(response: &'static [u8]) -> Fetch {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut request = [0u8; 4096];
+            let _ = server.read(&mut request).await;
+            let _ = server.write_all(response).await;
+        });
+        get(client, &Target::https("example.com"), 64 * 1024, Duration::from_secs(5)).await
+    }
+
+    #[tokio::test]
+    async fn a_whole_answer_is_complete() {
+        let fetch = fetch_from(b"HTTP/1.1 301 Moved\r\nLocation: http://block.example/\r\nContent-Length: 0\r\n\r\n").await;
+        assert_eq!(fetch.status, Some(301));
+        assert_eq!(fetch.location.as_deref(), Some("http://block.example/"));
+        assert_eq!(fetch.end, End::Complete);
+    }
+
+    #[tokio::test]
+    async fn an_answer_cut_before_its_length_is_broken() {
+        let fetch = fetch_from(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc").await;
+        assert_eq!(fetch.status, Some(200));
+        assert_eq!(fetch.end, End::Broken(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[tokio::test]
+    async fn silence_after_the_request_is_broken_too() {
+        let fetch = fetch_from(b"").await;
+        assert_eq!(fetch.status, None);
+        assert_eq!(fetch.bytes, 0);
+    }
+}

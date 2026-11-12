@@ -135,13 +135,16 @@ pub fn close_app() {
     }
 }
 
-/// A running exe cannot delete itself: a copy in the temp folder finishes the uninstall.
+pub const UNINSTALLER: &str = "zapretUI-uninstall.exe";
+
+/// A running exe cannot delete itself: a copy in a folder of its own finishes the uninstall.
+/// The copy runs elevated, so the folder is one that only administrators can write to.
 pub fn finish_from_temp(args: &[String]) -> anyhow::Result<bool> {
     let exe = std::env::current_exe()?;
     if !exe.starts_with(paths::install_dir()) {
         return Ok(false);
     }
-    let copy = std::env::temp_dir().join(format!("zapretUI-uninstall-{}.exe", std::process::id()));
+    let copy = crate::acl::private_dir("zapretUI-uninstall")?.join(UNINSTALLER);
     std::fs::copy(&exe, &copy)?;
     std::process::Command::new(&copy).args(args).creation_flags(DETACHED_PROCESS).spawn()?;
     Ok(true)

@@ -1,7 +1,7 @@
 use std::os::windows::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LUID, LocalFree};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
@@ -9,8 +9,10 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     ACL, AdjustTokenPrivileges, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
     LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    PSECURITY_DESCRIPTOR, PSID, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_QUERY,
 };
+use windows::Win32::Storage::FileSystem::CreateDirectoryW;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
@@ -27,6 +29,27 @@ pub fn secure(path: &Path) -> anyhow::Result<()> {
     enable(w!("SeRestorePrivilege"));
     enable(w!("SeTakeOwnershipPrivilege"));
     apply_tree(path)
+}
+
+/// A new folder for a file that will run elevated. The user's own temp folder will not do: programs
+/// without administrator rights can write there and swap the file before it starts. This one is born
+/// with rights for administrators and the system only, inside %SystemRoot%\Temp, where users can
+/// neither rename nor delete what is not theirs. Fails if the folder already exists.
+pub fn private_dir(prefix: &str) -> anyhow::Result<PathBuf> {
+    let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let path = root.join("Temp").join(format!("{prefix}-{}-{nanos:08x}", std::process::id()));
+    let sddl = HSTRING::from(DATA_DIR_SDDL);
+    unsafe {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl, SDDL_REVISION_1, &mut sd, None)?;
+        let attributes =
+            SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd.0, bInheritHandle: BOOL(0) };
+        let made = CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&attributes as *const SECURITY_ATTRIBUTES));
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+        made.with_context(|| format!("папка {}", path.display()))?;
+    }
+    Ok(path)
 }
 
 fn enable(name: PCWSTR) {

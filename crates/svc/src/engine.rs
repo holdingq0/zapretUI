@@ -8,7 +8,7 @@ use rkn_core::reserve::Reserve;
 use rkn_core::sites::{SiteMode, Sites};
 use rkn_engine::{Filter, Plan, Profile, Proto, lua_files, port_exclude_filter};
 use rkn_search::RESERVED_PORTS;
-use sha2::{Digest, Sha256};
+use ring::digest::{Context as Sha256, SHA256};
 use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -30,7 +30,7 @@ pub fn manifest() -> impl Iterator<Item = (&'static str, &'static str)> {
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha256::new(&SHA256);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf)?;
@@ -39,7 +39,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(rkn_core::release::hex(hasher.finish().as_ref()))
 }
 
 pub fn verify(dir: &Path) -> anyhow::Result<()> {
@@ -226,5 +226,73 @@ pub fn unload_driver() {
             Ok(_) => tracing::info!("WinDivert driver unloaded"),
             Err(e) => tracing::warn!("WinDivert driver stays loaded: {e}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tls() -> Recipe {
+        Recipe { payload: Payload::TlsClientHello, actions: vec![Action::Multisplit { pos: "2".into(), seqovl: None, seqovl_pattern: None }] }
+    }
+
+    fn names(plan: &Plan) -> Vec<&str> {
+        plan.profiles.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    #[test]
+    fn the_engine_manifest_lists_every_file_with_its_hash() {
+        let files: Vec<(&str, &str)> = manifest().collect();
+        assert_eq!(files.len(), SUMS.lines().filter(|l| !l.trim().is_empty()).count());
+        for name in ["winws2.exe", "cygwin1.dll", "WinDivert.dll", "WinDivert64.sys", "lua/zapret-lib.lua", "lua/zapret-antidpi.lua", "lua/zapret-auto.lua"] {
+            let hash = files.iter().find(|(_, n)| *n == name).map(|(h, _)| *h).unwrap_or_else(|| panic!("no {name}"));
+            assert!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "{name}: {hash}");
+        }
+        assert!(version().starts_with("zapret2 v"));
+    }
+
+    #[test]
+    fn nothing_to_bypass_means_no_engine() {
+        assert!(build_plan(&Sites::default(), &Reserve::default(), false, false, false, false).is_none());
+    }
+
+    #[test]
+    fn a_tls_strategy_brings_quic_along() {
+        let reserve = Reserve { tls: vec![tls()], ..Reserve::default() };
+        let plan = build_plan(&Sites::default(), &reserve, false, false, false, false).unwrap();
+        assert_eq!(names(&plan), ["tls", "quic"]);
+        assert_eq!((plan.wf_tcp_out.as_str(), plan.wf_udp_out.as_str()), ("443", "443"));
+        assert!(plan.blobs.is_empty());
+    }
+
+    #[test]
+    fn discord_and_hostings_get_their_profiles() {
+        let reserve = Reserve { tls: vec![tls()], ..Reserve::default() };
+        let plan = build_plan(&Sites::default(), &reserve, true, true, true, true).unwrap();
+        assert_eq!(names(&plan), ["tls", "hosting", "discord_media", "quic", "voice"]);
+        assert_eq!(plan.blobs.len(), 1);
+        assert!(plan.wf_udp_out.contains(VOICE_PORTS));
+        assert!(plan.wf_tcp_out.contains(DISCORD_MEDIA_PORTS));
+    }
+
+    /// winws2 since v1.0.7 refuses a profile that names the same list file twice.
+    #[test]
+    fn no_profile_names_a_list_file_twice() {
+        let mut sites = Sites::default();
+        sites.set("always.example".into(), SiteMode::Always);
+        sites.set("never.example".into(), SiteMode::Never);
+        let reserve = Reserve { tls: vec![tls(), tls()], http: vec![tls()], ..Reserve::default() };
+        let plan = build_plan(&sites, &reserve, true, true, true, true).unwrap();
+        for profile in &plan.profiles {
+            for list in [&profile.filter.hostlist, &profile.filter.hostlist_exclude, &profile.filter.ipset] {
+                let mut unique = list.clone();
+                unique.sort();
+                unique.dedup();
+                assert_eq!(unique.len(), list.len(), "{}: {list:?}", profile.name);
+            }
+        }
+        let args = plan.args();
+        assert!(args.iter().all(|a| !a.is_empty()));
     }
 }

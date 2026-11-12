@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 pub use net::PortBlock;
+pub use tls::Hello;
 
 use dns::{doh_global, system_global};
 use http::End;
@@ -72,11 +73,12 @@ pub struct Opts {
     pub connect: Duration,
     pub idle: Duration,
     pub want: usize,
+    pub hello: Hello,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { connect: Duration::from_secs(3), idle: Duration::from_secs(3), want: 64 * 1024 }
+        Self { connect: Duration::from_secs(3), idle: Duration::from_secs(3), want: 64 * 1024, hello: Hello::Small }
     }
 }
 
@@ -95,11 +97,13 @@ pub async fn fetch(target: &Target, ip: IpAddr, ports: Option<&PortBlock>, opts:
     let started = Instant::now();
     let tcp = match net::connect(ip, target.port(), ports, opts.connect).await {
         Ok(s) => s,
+        // A busy local port says nothing about the server: not a block by IP.
+        Err(e) if net::local(&e) => return Outcome::new(Verdict::Failed, Some(ip), format!("локальный порт занят: {e}")),
         Err(e) => return Outcome::new(Verdict::IpBlocked, Some(ip), format!("TCP: {}", net::describe(&e))),
     };
     let rtt = started.elapsed();
     let fetched = if target.tls {
-        match tls::handshake(tcp, &target.host, opts.idle).await {
+        match tls::handshake(tcp, &target.host, opts.idle, opts.hello).await {
             Ok(stream) => http::get(stream, target, opts.want, opts.idle).await,
             // A certificate the server did send but that does not check out is not DPI: a wrong clock
             // on this computer or a filter that swaps certificates. No bypass strategy fixes it.
@@ -140,6 +144,20 @@ pub async fn fetch(target: &Target, ip: IpAddr, ports: Option<&PortBlock>, opts:
     }
 }
 
+/// One fetch with each size of ClientHello (see `Hello`): the site opens only if both get through.
+/// The small one goes first, it is the one DPI catches more often; `opts.hello` is not looked at.
+pub async fn fetch_both(target: &Target, ip: IpAddr, ports: Option<&PortBlock>, opts: Opts) -> Outcome {
+    let small = fetch(target, ip, ports, Opts { hello: Hello::Small, ..opts }).await;
+    if !target.tls || small.verdict != Verdict::Ok {
+        return small;
+    }
+    let big = fetch(target, ip, ports, Opts { hello: Hello::Big, ..opts }).await;
+    match big.verdict {
+        Verdict::Ok => small,
+        _ => Outcome { detail: format!("{} (с большим ClientHello, как у браузера)", big.detail), ..big },
+    }
+}
+
 pub async fn probe(target: &Target, ports: Option<&PortBlock>, opts: Opts) -> Outcome {
     let system = system_global(&target.host).await;
     let mut last: Option<Outcome> = None;
@@ -150,7 +168,7 @@ pub async fn probe(target: &Target, ports: Option<&PortBlock>, opts: Opts) -> Ou
         many => many.iter().take(4).copied().collect(),
     };
     for ip in &tries {
-        let outcome = fetch(target, *ip, ports, opts).await;
+        let outcome = fetch_both(target, *ip, ports, opts).await;
         let retry = outcome.verdict == Verdict::IpBlocked;
         if outcome.verdict == Verdict::Ok {
             return outcome;
@@ -165,7 +183,7 @@ pub async fn probe(target: &Target, ports: Option<&PortBlock>, opts: Opts) -> Ou
         // addresses, and another one may be reachable.
         let spoofed = system.is_empty();
         for ip in doh_global(&target.host, &system).await.iter().take(2) {
-            let outcome = fetch(target, *ip, ports, opts).await;
+            let outcome = fetch_both(target, *ip, ports, opts).await;
             if outcome.verdict == Verdict::Ok {
                 // Only a resolver that gave no real address is lying. One that gave some dead
                 // addresses of a service that answers at others is not: the site opens.
@@ -185,4 +203,30 @@ pub async fn probe(target: &Target, ports: Option<&PortBlock>, opts: Opts) -> Ou
         }
     }
     last.unwrap_or_else(|| Outcome::new(Verdict::NoDns, None, "адрес сайта не найден"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_redirect_to_a_provider_stub_is_seen() {
+        let target = Target::http("rutracker.org");
+        assert!(stub_redirect(&target, Some("http://warning.rt.ru/?id=17&st=0")));
+        assert!(!stub_redirect(&target, Some("https://rutracker.org/forum/index.php")));
+        assert!(!stub_redirect(&target, Some("https://static.rutracker.org/blocked")));
+        assert!(!stub_redirect(&target, Some("/blocked")));
+        assert!(!stub_redirect(&target, Some("http://example.com/")));
+        assert!(!stub_redirect(&target, None));
+    }
+
+    #[test]
+    fn only_dpi_verdicts_are_fixable() {
+        for verdict in [Verdict::TlsBlocked, Verdict::Cut, Verdict::HttpBlocked] {
+            assert!(verdict.fixable());
+        }
+        for verdict in [Verdict::Ok, Verdict::NoDns, Verdict::DnsSpoofed, Verdict::IpBlocked, Verdict::Geoblocked, Verdict::Failed] {
+            assert!(!verdict.fixable());
+        }
+    }
 }

@@ -40,6 +40,14 @@ impl NetMemory {
     }
 }
 
+/// Marks the network as seen now: `prune` goes by the file's date, and a network whose strategy has
+/// worked untouched for a year is still a network in use.
+pub fn touch(id: &str) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(paths::network_file(id)) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
 /// Forgets networks not seen for a year (a café, a friend's Wi-Fi): one file per network otherwise
 /// piles up forever. The current network is always kept.
 pub fn prune(keep: &str, max_age: std::time::Duration) {

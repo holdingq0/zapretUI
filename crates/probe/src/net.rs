@@ -57,6 +57,11 @@ pub async fn connect(ip: IpAddr, port: u16, ports: Option<&PortBlock>, limit: Du
     Ok(stream)
 }
 
+/// The connection failed on this computer (no free local port), not on the way to the server.
+pub fn local(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::AddrInUse | io::ErrorKind::AddrNotAvailable)
+}
+
 pub fn describe(e: &io::Error) -> String {
     match e.kind() {
         io::ErrorKind::TimedOut => "нет ответа".into(),

@@ -107,3 +107,48 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        let file = |place, path: &str, size| FileEntry { place, path: path.into(), size, sha256: String::new() };
+        Manifest { version: "1.2.3".into(), files: vec![file(Place::Bin, "a.exe", 3), file(Place::Engine, "lua/b.lua", 2)] }
+    }
+
+    #[test]
+    fn a_pack_comes_back_out_of_the_installer() {
+        let manifest = manifest();
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let signature = [7u8; SIGNATURE_LEN];
+        let packed = pack(&body, &signature, &[b"abc".to_vec(), b"de".to_vec()]);
+        let exe = b"MZ installer".to_vec();
+        let whole = attach(&exe, &packed);
+
+        let found = attached(&whole).unwrap();
+        assert_eq!(found, &packed[..]);
+        let (got_manifest, got_signature, files) = unpack(found).unwrap();
+        assert_eq!(got_manifest, &body[..]);
+        assert_eq!(got_signature, &signature[..]);
+        assert_eq!(split(&manifest, files).unwrap(), vec![&b"abc"[..], &b"de"[..]]);
+    }
+
+    #[test]
+    fn broken_input_is_refused() {
+        let manifest = manifest();
+        assert!(attached(b"MZ installer without a pack").is_none());
+        assert!(unpack(b"ZUIUPD01\x01\x00").is_none());
+        assert!(unpack(b"not a pack at all").is_none());
+        assert!(split(&manifest, b"abcd").is_none(), "too short");
+        assert!(split(&manifest, b"abcdef").is_none(), "bytes left over");
+    }
+
+    #[test]
+    fn hex_round_trip() {
+        assert_eq!(hex(&[10, 255, 0]), "0aff00");
+        assert_eq!(unhex(" 0aFF00\n"), Some(vec![10, 255, 0]));
+        assert_eq!(unhex("abc"), None);
+        assert_eq!(unhex("zz"), None);
+    }
+}

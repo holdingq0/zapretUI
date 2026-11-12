@@ -136,3 +136,18 @@ pub fn newer(candidate: &str, current: &str) -> bool {
     let parts = |v: &str| -> Vec<u64> { v.trim().trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect() };
     parts(candidate) > parts(current)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::newer;
+
+    #[test]
+    fn versions_compare_by_number() {
+        assert!(newer("0.2.10", "0.2.9"));
+        assert!(newer("v0.1.4", "0.1.3"));
+        assert!(newer("1.0", "0.9.9"));
+        assert!(!newer("0.1.3", "0.1.3"));
+        assert!(!newer("v0.1.3", "0.1.3"));
+        assert!(!newer("0.1.3", "0.1.4"));
+    }
+}

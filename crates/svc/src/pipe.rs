@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use interprocess::local_socket::tokio::{RecvHalf, Stream, prelude::*};
+use interprocess::local_socket::tokio::{Stream, prelude::*};
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions};
 use interprocess::os::windows::local_socket::ListenerOptionsExt;
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
@@ -46,8 +46,8 @@ pub async fn serve(hub: Arc<Hub>) -> anyhow::Result<()> {
     }
 }
 
-async fn read_requests(recv: RecvHalf, tx: mpsc::Sender<Result<Request, String>>) -> anyhow::Result<()> {
-    let mut reader = BufReader::new(recv);
+async fn read_requests(conn: Arc<Stream>, tx: mpsc::Sender<Result<Request, String>>) -> anyhow::Result<()> {
+    let mut reader = BufReader::new(&*conn);
     let mut line = String::new();
     loop {
         line.clear();
@@ -74,9 +74,11 @@ async fn send_all<W: AsyncWrite + Unpin>(send: &mut W, bytes: &[u8]) -> anyhow::
 }
 
 async fn handle(hub: Arc<Hub>, conn: Stream) -> anyhow::Result<()> {
-    let (recv, mut send) = conn.split();
+    // One task reads requests, this one writes answers: both through the shared stream.
+    let conn = Arc::new(conn);
+    let mut send = &*conn;
     let (tx, mut requests) = mpsc::channel(8);
-    let reader = tokio::spawn(read_requests(recv, tx));
+    let reader = tokio::spawn(read_requests(conn.clone(), tx));
     let mut events: Option<broadcast::Receiver<Message>> = None;
 
     let result: anyhow::Result<()> = async {
