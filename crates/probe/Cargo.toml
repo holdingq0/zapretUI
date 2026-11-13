@@ -11,3 +11,7 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
 aws-lc-rs.workspace = true
+# DoH to the resolvers for the neural networks: some of them speak HTTP/2 only.
+h2 = "0.4"
+http = "1"
+bytes = "1"

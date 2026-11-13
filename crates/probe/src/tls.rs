@@ -25,8 +25,13 @@ pub enum Hello {
 }
 
 static CONFIGS: OnceLock<[Option<Arc<ClientConfig>>; 2]> = OnceLock::new();
+static H2: OnceLock<Option<Arc<ClientConfig>>> = OnceLock::new();
 
 fn build(hello: Hello) -> Option<Arc<ClientConfig>> {
+    build_for(hello, b"http/1.1")
+}
+
+fn build_for(hello: Hello, alpn: &[u8]) -> Option<Arc<ClientConfig>> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     if hello == Hello::Small {
         provider.kx_groups.retain(|g| matches!(g.name(), NamedGroup::X25519 | NamedGroup::secp256r1 | NamedGroup::secp384r1));
@@ -37,7 +42,7 @@ fn build(hello: Hello) -> Option<Arc<ClientConfig>> {
         .ok()?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![alpn.to_vec()];
     Some(Arc::new(config))
 }
 
@@ -58,6 +63,19 @@ pub async fn handshake(tcp: TcpStream, host: &str, limit: Duration, hello: Hello
     tokio::time::timeout(limit, connector.connect(name, tcp))
         .await
         .map_err(|_| timed_out("нет ответа на ClientHello"))?
+}
+
+/// A handshake that settles on HTTP/2, for a DoH resolver.
+pub async fn handshake_h2(tcp: TcpStream, host: &str, limit: Duration) -> io::Result<TlsStream<TcpStream>> {
+    let name = ServerName::try_from(host.to_owned()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let config = H2.get_or_init(|| build_for(Hello::Big, b"h2")).clone().ok_or_else(|| io::Error::other("TLS не инициализирован"))?;
+    let stream = tokio::time::timeout(limit, TlsConnector::from(config).connect(name, tcp))
+        .await
+        .map_err(|_| timed_out("нет ответа на ClientHello"))??;
+    if stream.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+        return Err(io::Error::other("сервер не говорит по HTTP/2"));
+    }
+    Ok(stream)
 }
 
 #[cfg(test)]

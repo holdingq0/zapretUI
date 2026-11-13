@@ -1,19 +1,22 @@
 mod acl;
+mod aidns;
 mod app;
 mod engine;
 mod hub;
 mod install;
 mod logging;
 mod netid;
+mod nrpt;
 mod pipe;
 mod procs;
 mod service;
+mod sysdns;
 mod targets;
 mod tuner;
 mod system;
 mod update;
 
-const USAGE: &str = "zapretUI-svc install | uninstall [--purge] | run | portable | probe [host...]";
+const USAGE: &str = "zapretUI-svc install | uninstall [--purge] | run | portable | probe [host...] | ai";
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -21,6 +24,7 @@ fn main() -> anyhow::Result<()> {
         Some("install") => install::install(),
         Some("uninstall") => install::uninstall(&args),
         Some("probe") => tuner::cli_probe(&args[1..]),
+        Some("ai") => aidns::cli(),
         Some("restart") => install::restart(),
         Some("start") => install::start(),
         Some("autostart") => {

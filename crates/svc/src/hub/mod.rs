@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use rkn_core::config::Config;
 use rkn_core::ipc::{
-    Event, Kind, Learn, Level, LineKind, LogLine, Message, Phase, Request, SiteState, SiteStatus, State, Status, Update,
+    Event, Kind, Learn, Level, LineKind, LogLine, Message, Phase, Request, SiteState, SiteStatus, State, Status, SystemDns, Update,
     UpdateState,
 };
 use rkn_core::memory::{NetMemory, now};
@@ -108,9 +108,22 @@ struct Inner {
     has_ipset: bool,
     update: Update,
     updating: bool,
+    /// How each neural network fares with the chosen resolver, by service id.
+    ai: BTreeMap<String, SiteState>,
+    /// The DNS Windows itself is set to, as the forwarder last read it.
+    sysdns: SystemDns,
 }
 
 impl Inner {
+    /// The resolver for the neural networks as the forwarder should have it now; empty while the
+    /// bypass is paused or none is chosen.
+    fn ai_spec(&self) -> String {
+        match self.config.enabled && rkn_core::aidns::upstream(&self.config.ai_dns).is_some() {
+            true => self.config.ai_dns.trim().to_owned(),
+            false => String::new(),
+        }
+    }
+
     fn reserve(&self) -> Reserve {
         self.memory.as_ref().map(|m| m.reserve.clone()).unwrap_or_default()
     }
@@ -180,6 +193,10 @@ pub struct Hub {
     moved: watch::Sender<u64>,
     stop: watch::Sender<u64>,
     quit: watch::Sender<bool>,
+    /// The resolver for the neural networks the forwarder should run with (`Inner::ai_spec`).
+    ai_dns: watch::Sender<String>,
+    /// A window has connected: the look at the neural networks should be fresh.
+    ai_poke: tokio::sync::Notify,
 }
 
 impl Hub {
@@ -236,6 +253,8 @@ impl Hub {
                     ..Update::default()
                 },
                 updating: false,
+                ai: BTreeMap::new(),
+                sysdns: SystemDns::default(),
             }),
             tx,
             jobs,
@@ -244,9 +263,12 @@ impl Hub {
             moved: watch::channel(0).0,
             stop: watch::channel(0).0,
             quit: watch::channel(false).0,
+            ai_dns: watch::channel(String::new()).0,
+            ai_poke: tokio::sync::Notify::new(),
         };
         {
             let mut inner = hub.lock();
+            hub.sync_ai(&mut inner);
             // Only with the network known: at boot before Wi-Fi is up it is not, and home must not go.
             if !inner.network.is_unknown() {
                 rkn_core::memory::prune(&inner.network.id, Duration::from_secs(365 * 24 * 3600));
@@ -348,6 +370,8 @@ impl Hub {
     pub fn subscribe(&self) -> (Status, broadcast::Receiver<Message>) {
         let mut inner = self.lock();
         let rx = self.tx.subscribe();
+        // A window has just opened: the neural networks get a fresh look for it.
+        self.ai_poke.notify_one();
         (status(&mut inner), rx)
     }
 
@@ -393,6 +417,47 @@ impl Hub {
 
     pub fn stops(&self) -> watch::Receiver<u64> {
         self.stop.subscribe()
+    }
+
+    pub async fn ai_poked(&self) {
+        self.ai_poke.notified().await
+    }
+
+    pub fn ai_dns(&self) -> watch::Receiver<String> {
+        self.ai_dns.subscribe()
+    }
+
+    /// Tells the forwarder which resolver the settings ask for now. What was known about the old
+    /// one says nothing about the new.
+    fn sync_ai(&self, inner: &mut Inner) {
+        let spec = inner.ai_spec();
+        let changed = self.ai_dns.send_if_modified(|current| {
+            let differs = *current != spec;
+            if differs {
+                *current = spec;
+            }
+            differs
+        });
+        if changed {
+            inner.ai.clear();
+        }
+    }
+
+    pub fn set_system_dns(&self, dns: SystemDns) {
+        let mut inner = self.lock();
+        if inner.sysdns != dns {
+            inner.sysdns = dns;
+            self.publish(&mut inner);
+        }
+    }
+
+    /// The forwarder's report: whether the neural networks let in, with the resolver `spec` in effect.
+    pub fn set_ai(&self, spec: &str, states: BTreeMap<String, SiteState>) {
+        let mut inner = self.lock();
+        if inner.ai_spec() == spec && inner.ai != states {
+            inner.ai = states;
+            self.publish(&mut inner);
+        }
     }
 
     pub fn note(&self, level: Level, text: String) {

@@ -113,6 +113,8 @@ pub fn site_short(site: &SiteStatus, learning: bool) -> (&'static str, Tone) {
         SiteState::IpBlocked => ("блок по IP", Tone::Bad),
         SiteState::DnsSpoofed => ("подмена DNS", Tone::Bad),
         SiteState::Geoblocked => ("закрыт для РФ", Tone::Bad),
+        SiteState::Open => ("доступен", Tone::Ok),
+        SiteState::DnsDown => ("DNS молчит", Tone::Bad),
         SiteState::Unknown => ("не проверялся", Tone::Mute),
     }
 }

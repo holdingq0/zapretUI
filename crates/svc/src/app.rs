@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::hub::Hub;
-use crate::{pipe, tuner, update};
+use crate::{aidns, pipe, tuner, update};
 
 pub async fn run(shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
     let (jobs_tx, jobs) = tokio::sync::mpsc::unbounded_channel();
@@ -22,6 +22,7 @@ pub async fn run(shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
     let tuner = tokio::spawn(tuner::run(hub.clone(), jobs));
     let verifier = tokio::spawn(tuner::verifier(hub.clone(), verify));
     let updater = tokio::spawn(update::run(hub.clone(), updates));
+    let ai = tokio::spawn(aidns::run(hub.clone()));
     let ticker = {
         let hub = hub.clone();
         tokio::spawn(async move {
@@ -49,7 +50,15 @@ pub async fn run(shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
     tuner.abort();
     verifier.abort();
     updater.abort();
-    tokio::task::spawn_blocking(move || hub.shutdown()).await?;
+    ai.abort();
+    // The forwarder is going away: its rules must not stay behind, or the neural networks' names
+    // would be asked from a server that no longer answers.
+    let _ = ai.await;
+    tokio::task::spawn_blocking(move || {
+        aidns::cleanup();
+        hub.shutdown()
+    })
+    .await?;
     tracing::info!("stopped");
     result
 }

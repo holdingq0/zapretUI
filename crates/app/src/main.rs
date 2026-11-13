@@ -4,6 +4,7 @@
 
 mod admin;
 mod autostart;
+mod clip;
 mod field;
 mod gfx;
 mod icons;
@@ -562,6 +563,36 @@ fn act(app: &mut App, act: Act) -> Option<Act> {
             send(tray, Tag::Saved, Request::SetConfig { config });
         }
         Act::SiteMode(host, mode) => send(tray, Tag::Plain, Request::SetSiteMode { host, mode }),
+        Act::Dns(i) => {
+            use rkn_core::aidns::{self, PRESETS};
+            let mut config = app.config.clone()?;
+            let spec = if i == 0 {
+                String::new()
+            } else if let Some(preset) = PRESETS.get(i - 1) {
+                preset.id.to_owned()
+            } else {
+                // "Свой": the address kept from before, or a new one from the clipboard. A click on
+                // the choice already in use is the way to replace it.
+                let in_use = aidns::custom(&config.ai_dns).is_some();
+                if !in_use && !config.ai_dns_custom.is_empty() {
+                    config.ai_dns_custom.clone()
+                } else if let Some(pasted) = clip::text().and_then(|text| aidns::custom(&text)) {
+                    config.ai_dns_custom = pasted.clone();
+                    pasted
+                } else {
+                    if let Some(main) = &mut app.main {
+                        main.ui.say("Скопируйте адрес DoH (https://…/dns-query) или IP своего DNS и нажмите «Свой» ещё раз".into());
+                        invalidate(main);
+                    }
+                    return None;
+                }
+            };
+            if config.ai_dns != spec {
+                config.ai_dns = spec;
+                app.config = Some(config.clone());
+                send(tray, Tag::Saved, Request::SetConfig { config });
+            }
+        }
     }
     None
 }

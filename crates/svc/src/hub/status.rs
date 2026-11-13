@@ -43,9 +43,14 @@ pub(super) fn status(inner: &mut Inner) -> Status {
     }
 
     let mut sites: Vec<SiteStatus> = Vec::new();
+    let mut ai: Vec<SiteStatus> = Vec::new();
     for service in &targets::catalog().service {
         let id = service.id();
         let found = groups.remove(&id);
+        if service.kind == Kind::Ai {
+            ai.push(ai_row(inner, id, service));
+            continue;
+        }
         if service.kind == Kind::Site && service.probe.is_empty() && found.is_none() {
             continue;
         }
@@ -73,7 +78,24 @@ pub(super) fn status(inner: &mut Inner) -> Status {
         version: env!("CARGO_PKG_VERSION").into(),
         update: inner.update.clone(),
         portable: paths::portable(),
+        dns: inner.sysdns.clone(),
+        ai,
         learn: inner.learn.clone(),
+    }
+}
+
+/// A neural network: the bypass has no say in it. The row says whether it lets this computer in now.
+fn ai_row(inner: &Inner, id: String, service: &targets::Service) -> SiteStatus {
+    let state = inner.ai.get(&id).copied().unwrap_or(SiteState::Checking);
+    SiteStatus {
+        id,
+        name: service.name.clone(),
+        state,
+        mode: SiteMode::Auto,
+        kind: service.kind,
+        icon: service.icon.clone(),
+        running: false,
+        via: false,
     }
 }
 

@@ -50,7 +50,6 @@ pub enum State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SiteState {
-    Unknown,
     Checking,
     Direct,
     Bypassed,
@@ -60,6 +59,14 @@ pub enum SiteState {
     IpBlocked,
     DnsSpoofed,
     Geoblocked,
+    /// A neural network that lets this computer in right now.
+    Open,
+    /// The name of a neural network gets no answer from DNS.
+    DnsDown,
+    /// Not checked yet. Also what a state added by a newer service reads as: a window that is a
+    /// version behind must still understand the status, or it never learns it has to hand over.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -69,6 +76,8 @@ pub enum Kind {
     Site,
     Launcher,
     Game,
+    /// A neural network: closed for Russia by the service itself, opened by DNS and not by the bypass.
+    Ai,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +158,24 @@ pub struct Status {
     pub update: Update,
     #[serde(default)]
     pub portable: bool,
+    #[serde(default)]
+    pub dns: SystemDns,
+    /// The neural networks. Rows of their own and not part of `sites`: their kind and states are
+    /// newer than the windows of 0.1.5, which skip a field they do not know and would choke on an
+    /// unknown state inside `sites`.
+    #[serde(default)]
+    pub ai: Vec<SiteStatus>,
+}
+
+/// The DNS Windows itself is set to, for the settings screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemDns {
+    pub servers: Vec<String>,
+    /// DoH addresses set for those servers in Windows.
+    pub doh: Vec<String>,
+    /// It answers for the neural networks with a relay of its own: they open without a resolver
+    /// chosen in the program.
+    pub relay: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -206,6 +233,81 @@ impl Event {
         self
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The status as the window of 0.1.5 reads it: the states it knew and nothing else.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum OldState {
+        Unknown,
+        Checking,
+        Direct,
+        Bypassed,
+        Tuning,
+        Partial,
+        Blocked,
+        IpBlocked,
+        DnsSpoofed,
+        Geoblocked,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum OldKind {
+        Site,
+        Launcher,
+        Game,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct OldSite {
+        #[allow(dead_code)]
+        state: OldState,
+        #[allow(dead_code)]
+        kind: OldKind,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct OldStatus {
+        sites: Vec<OldSite>,
+        version: String,
+    }
+
+    fn row(state: SiteState, kind: Kind) -> SiteStatus {
+        SiteStatus { id: "a.com".into(), name: "A".into(), state, mode: SiteMode::Auto, kind, icon: None, running: false, via: false }
+    }
+
+    #[test]
+    fn an_older_window_still_reads_the_status() {
+        let status = Status {
+            state: State::Working,
+            network: None,
+            link: Link::Other,
+            sites: vec![row(SiteState::Bypassed, Kind::Site), row(SiteState::Unknown, Kind::Game)],
+            message: None,
+            learn: None,
+            version: "9.9.9".into(),
+            update: Update::default(),
+            portable: false,
+            dns: SystemDns { servers: vec!["1.2.3.4".into()], doh: Vec::new(), relay: true },
+            ai: vec![row(SiteState::Open, Kind::Ai), row(SiteState::DnsDown, Kind::Ai)],
+        };
+        let wire = encode(&Message::Status(Box::new(status)));
+        let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        let old: OldStatus = serde_json::from_value(value["data"].clone()).expect("the window of 0.1.5 must read this");
+        assert_eq!(old.sites.len(), 2);
+        assert_eq!(old.version, "9.9.9");
+    }
+
+    #[test]
+    fn a_state_from_a_newer_service_reads_as_unknown() {
+        let state: SiteState = serde_json::from_str("\"something_new\"").unwrap();
+        assert_eq!(state, SiteState::Unknown);
+    }
 }
 
 pub fn encode<T: Serialize>(value: &T) -> String {

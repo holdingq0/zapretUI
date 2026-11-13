@@ -29,6 +29,11 @@ impl Hub {
                 config.check_interval_min = config.check_interval_min.clamp(2, 60);
                 // Pause has its own request; a settings screen opened earlier must not undo it.
                 config.enabled = inner.config.enabled;
+                // A resolver that does not read is the same as none chosen.
+                if rkn_core::aidns::upstream(&config.ai_dns).is_none() {
+                    config.ai_dns.clear();
+                }
+                config.ai_dns_custom = rkn_core::aidns::custom(&config.ai_dns_custom).unwrap_or_default();
                 inner.config = config;
                 inner.config.save()
             }
@@ -92,6 +97,8 @@ impl Hub {
                 Ok(())
             }
         };
+        // Pause, the settings and "tune again" all may change whether the forwarder should run.
+        self.sync_ai(&mut inner);
         self.publish(&mut inner);
         match reply {
             Ok(()) => Message::Ok,

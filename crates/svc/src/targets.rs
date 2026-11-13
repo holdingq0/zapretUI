@@ -85,7 +85,20 @@ pub fn background(host: &str) -> bool {
 }
 
 pub fn games() -> impl Iterator<Item = &'static Service> {
-    catalog().service.iter().filter(|s| s.kind != Kind::Site)
+    catalog().service.iter().filter(|s| matches!(s.kind, Kind::Game | Kind::Launcher))
+}
+
+/// The neural networks: opened by DNS, so the bypass neither probes nor tunes them.
+pub fn ai() -> impl Iterator<Item = &'static Service> {
+    catalog().service.iter().filter(|s| s.kind == Kind::Ai)
+}
+
+/// Every domain whose names go to the resolver for the neural networks.
+pub fn ai_domains() -> Vec<String> {
+    let mut out: Vec<String> = ai().flat_map(|s| s.domains.iter().cloned()).collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -114,7 +127,7 @@ pub fn catalog() -> &'static Catalog {
 
 pub fn sites() -> Vec<Entry> {
     let mut out = Vec::new();
-    for service in &catalog().service {
+    for service in catalog().service.iter().filter(|s| s.kind != Kind::Ai) {
         for host in &service.probe {
             out.push(Entry { name: service.name.clone(), host: host.clone(), http: false, path: service.path.clone() });
         }
@@ -220,6 +233,22 @@ mod tests {
         }
         assert!(hosting_ipset(&[]).is_empty());
         assert!(hosting_ipset(&["youtube.com".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn neural_networks_are_left_to_dns() {
+        assert!(ai().count() > 0);
+        for service in ai() {
+            assert!(!service.probe.is_empty() && !service.domains.is_empty(), "{}", service.name);
+            assert!(!service.always && service.ipset.is_none(), "{}", service.name);
+            assert!(sites().iter().all(|e| e.name != service.name), "{}: probed as a site", service.name);
+        }
+        let domains = ai_domains();
+        assert!(domains.contains(&"chatgpt.com".to_string()) && domains.contains(&"claude.ai".to_string()));
+        // A whole google.com or microsoft.com must never go to somebody's relay.
+        for wide in ["google.com", "googleapis.com", "microsoft.com", "youtube.com"] {
+            assert!(!domains.contains(&wide.to_string()), "{wide}");
+        }
     }
 
     #[test]

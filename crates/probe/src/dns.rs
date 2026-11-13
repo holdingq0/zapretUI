@@ -61,43 +61,47 @@ async fn system(host: &str) -> Vec<IpAddr> {
 }
 
 async fn doh(host: &str) -> Option<Vec<IpAddr>> {
+    let answer = public(&query(host)?, |answer| parse_a(answer).is_some()).await?;
+    parse_a(&answer)
+}
+
+/// Asks the public resolvers all at once; the first answer that `accept` takes wins.
+pub(crate) async fn public(body: &[u8], accept: fn(&[u8]) -> bool) -> Option<Vec<u8>> {
     let mut set = JoinSet::new();
     for (name, ip) in DOH {
-        let host = host.to_owned();
-        set.spawn(async move { doh_one(name, Ipv4Addr::from(ip), &host).await });
+        let body = body.to_vec();
+        set.spawn(async move { doh_one(name, Ipv4Addr::from(ip), &body).await });
     }
     while let Some(result) = set.join_next().await {
-        if let Ok(Some(ips)) = result {
-            set.abort_all();
-            return Some(ips);
+        if let Ok(Some(answer)) = result {
+            if accept(&answer) {
+                set.abort_all();
+                return Some(answer);
+            }
         }
     }
     None
 }
 
-async fn doh_one(name: &str, server: Ipv4Addr, host: &str) -> Option<Vec<IpAddr>> {
+async fn doh_one(name: &str, server: Ipv4Addr, body: &[u8]) -> Option<Vec<u8>> {
     let exchange = async {
         let tcp = net::connect(IpAddr::V4(server), 443, None, Duration::from_secs(3)).await.ok()?;
         let mut stream = tls::handshake(tcp, name, Duration::from_secs(3), tls::Hello::Small).await.ok()?;
-        let body = query(host)?;
         let head = format!(
             "POST /dns-query HTTP/1.1\r\nHost: {name}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(head.as_bytes()).await.ok()?;
-        stream.write_all(&body).await.ok()?;
+        stream.write_all(body).await.ok()?;
         let mut raw = Vec::new();
         let _ = stream.read_to_end(&mut raw).await;
         let (status, answer) = http::body(&raw)?;
-        if status != 200 {
-            return None;
-        }
-        parse_a(&answer)
+        (status == 200).then_some(answer)
     };
     tokio::time::timeout(Duration::from_secs(5), exchange).await.ok().flatten()
 }
 
-fn query(host: &str) -> Option<Vec<u8>> {
+pub(crate) fn query(host: &str) -> Option<Vec<u8>> {
     let mut q = vec![0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
     for label in host.trim_end_matches('.').split('.') {
         if label.is_empty() || label.len() > 63 {
@@ -110,7 +114,7 @@ fn query(host: &str) -> Option<Vec<u8>> {
     Some(q)
 }
 
-fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
+pub(crate) fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         let len = *buf.get(pos)? as usize;
         if len == 0 {
@@ -127,7 +131,7 @@ fn u16_at(buf: &[u8], pos: usize) -> Option<usize> {
     Some(u16::from_be_bytes([*buf.get(pos)?, *buf.get(pos + 1)?]) as usize)
 }
 
-fn parse_a(buf: &[u8]) -> Option<Vec<IpAddr>> {
+pub(crate) fn parse_a(buf: &[u8]) -> Option<Vec<IpAddr>> {
     let rcode = buf.get(3)? & 0x0f;
     if rcode == 3 {
         return Some(Vec::new());

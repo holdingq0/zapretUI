@@ -278,6 +278,7 @@ pub fn uninstall(args: &[String]) -> anyhow::Result<()> {
         println!("Служба {SERVICE_NAME} удалена");
     }
     engine::unload_driver();
+    crate::nrpt::remove();
     system::remove_entries();
     let dir = paths::install_dir();
     if let Ok(entries) = std::fs::read_dir(&dir) {

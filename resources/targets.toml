@@ -77,6 +77,40 @@ probe = ["proof.ovh.net"]
 path = "/files/10Mb.dat"
 ipset = "ovh"
 
+# Neural networks. The provider does not cut them: they refuse visitors from Russia themselves, so
+# the bypass does nothing for them. Their names are asked from the resolver chosen in the settings
+# (see rkn_core::aidns), which answers with the address of its relay. Only the domains listed here
+# go there, so nothing as wide as google.com belongs in these lists.
+[[service]]
+name = "ChatGPT"
+kind = "ai"
+domains = ["chatgpt.com", "openai.com", "oaiusercontent.com", "oaistatic.com", "sora.com"]
+probe = ["chatgpt.com"]
+
+[[service]]
+name = "Claude"
+kind = "ai"
+domains = ["claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com"]
+probe = ["claude.ai"]
+
+[[service]]
+name = "Gemini"
+kind = "ai"
+domains = ["gemini.google.com", "aistudio.google.com", "notebooklm.google.com", "labs.google", "ai.google.dev", "generativelanguage.googleapis.com", "alkalimakersuite-pa.clients6.google.com", "webchannel-alkalimakersuite-pa.clients6.google.com", "proactivebackend-pa.googleapis.com", "aisandbox-pa.googleapis.com", "jules.google.com"]
+probe = ["gemini.google.com"]
+
+[[service]]
+name = "Copilot"
+kind = "ai"
+domains = ["copilot.microsoft.com", "copilot.com"]
+probe = ["copilot.microsoft.com"]
+
+[[service]]
+name = "Cursor"
+kind = "ai"
+domains = ["cursor.com", "cursor.sh"]
+probe = ["api2.cursor.sh"]
+
 [[service]]
 name = "EA app"
 kind = "launcher"

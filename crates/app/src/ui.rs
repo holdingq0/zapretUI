@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use rkn_core::config::Config;
-use rkn_core::ipc::{Kind, LineKind, Link, Phase, SiteState, State, Status, UpdateState};
+use rkn_core::ipc::{Kind, LineKind, Link, Phase, SiteState, State, Status, SystemDns, UpdateState};
 use rkn_core::sites::SiteMode;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::DirectWrite::{DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_TRAILING, IDWriteTextLayout};
@@ -72,6 +72,10 @@ pub enum Hit {
     Site(usize),
     /// An item of the open mode menu: auto, always through the bypass, always direct.
     Mode(usize),
+    /// A neural network on the services screen: its DNS is chosen in the settings.
+    Ai(usize),
+    /// A choice of DNS for the neural networks in the settings, by its place in `dns_options`.
+    Dns(usize),
 }
 
 /// What a click asks the app to do; runs after the UI state is released.
@@ -88,6 +92,41 @@ pub enum Act {
     LoadConfig,
     Toggle(usize),
     SiteMode(String, SiteMode),
+    /// A choice of DNS for the neural networks, by its place in `dns_options`.
+    Dns(usize),
+}
+
+/// The addresses behind the DNS in use for the neural networks: its numbers and its DoH address.
+fn dns_details(config: &Config, system: Option<&SystemDns>) -> (String, String) {
+    match rkn_core::aidns::upstream(&config.ai_dns) {
+        Some(upstream) => {
+            let ips: Vec<String> = upstream.ips.iter().map(ToString::to_string).collect();
+            let ips = if ips.is_empty() { "по имени сервера".to_string() } else { ips.join(", ") };
+            (ips, upstream.url().unwrap_or_else(|| "нет, обычный DNS на порту 53".to_string()))
+        }
+        None => match system.filter(|s| !s.servers.is_empty()) {
+            Some(system) => (system.servers.join(", "), system.doh.first().cloned().unwrap_or_else(|| "не задан".to_string())),
+            None => ("не определён".to_string(), "не задан".to_string()),
+        },
+    }
+}
+
+/// The choices of DNS for the neural networks: the one Windows is set to, the known resolvers,
+/// the user's own. Each with its note and whether it is the one in use.
+pub fn dns_options(config: &Config, system: Option<&SystemDns>) -> Vec<(String, String, bool)> {
+    use rkn_core::aidns::{self, PRESETS};
+    let chosen = config.ai_dns.trim();
+    let preset = PRESETS.iter().position(|p| p.id == chosen);
+    let off = aidns::upstream(chosen).is_none();
+    let works = if system.is_some_and(|s| s.relay) { "открывает нейросети" } else { "" };
+    let mut out = vec![("Системный".to_string(), works.to_string(), off)];
+    for (i, p) in PRESETS.iter().enumerate() {
+        out.push((p.name.to_string(), String::new(), preset == Some(i)));
+    }
+    let own = !off && preset.is_none();
+    let kept = if own { aidns::label(chosen) } else { aidns::label(&config.ai_dns_custom) };
+    out.push(("Свой".to_string(), kept.map_or_else(|| "из буфера обмена".to_string(), |name| clip(&name, 26)), own));
+    out
 }
 
 pub const TOGGLES: [(&str, &str); 2] = [
@@ -425,6 +464,8 @@ impl Ui {
                 Act::Relearn
             }
             Hit::Toggle(i) => Act::Toggle(i),
+            Hit::Ai(_) => self.go(Screen::Settings),
+            Hit::Dns(i) => Act::Dns(i),
             // A row opens its menu; the same row again closes it.
             Hit::Site(i) => {
                 let Some((id, mode)) = self.rows.get(i).cloned() else { return Act::None };
@@ -940,6 +981,7 @@ impl Ui {
         games.sort_by_key(|s| !s.running);
         let groups = [
             ("САЙТЫ", sites.iter().filter(|s| s.kind == Kind::Site).collect::<Vec<_>>()),
+            ("НЕЙРОСЕТИ", status.map(|s| s.ai.iter().collect()).unwrap_or_default()),
             ("ИГРЫ", games),
             ("ЛАУНЧЕРЫ", sites.iter().filter(|s| s.kind == Kind::Launcher).collect()),
         ];
@@ -953,10 +995,13 @@ impl Ui {
             let head = g.layout(&format!("// {title}"), Font::Mono, 10.5, 600, 0.0);
             let hw = metrics(&head).width;
             self.label(c, &head, 18.0, y, t.mute, k);
-            let through = items.iter().filter(|s| s.state == SiteState::Bypassed).count();
+            // Neural networks are opened by DNS, not by the bypass: what counts is whether they let in.
+            let ai = items.first().is_some_and(|s| s.kind == Kind::Ai);
+            let (opened, how) = if ai { (SiteState::Open, "доступно") } else { (SiteState::Bypassed, "через обход") };
+            let through = items.iter().filter(|s| s.state == opened).count();
             let mut lead_end = W - 18.0;
             if through > 0 {
-                let l = g.layout(&format!("{through} через обход"), Font::Mono, 10.5, 400, 160.0);
+                let l = g.layout(&format!("{through} {how}"), Font::Mono, 10.5, 400, 160.0);
                 align(&l, DWRITE_TEXT_ALIGNMENT_TRAILING);
                 c.text(&l, W - 18.0 - 160.0, y, t.ok, k);
                 lead_end = W - 18.0 - metrics(&l).width - 8.0;
@@ -969,10 +1014,15 @@ impl Ui {
                 let ry = y + 4.0 + i as f32 * 40.0;
                 let row = rect(20.0, ry, W - 40.0, 40.0);
                 // A game without its own domains has nothing for the service to route: no click.
-                let hit = (!s.id.starts_with("game:")).then(|| {
-                    self.rows.push((s.id.clone(), s.mode));
-                    Hit::Site(self.rows.len() - 1)
-                });
+                // A neural network has no bypass mode: its row leads to the choice of DNS.
+                let hit = if ai {
+                    Some(Hit::Ai(i))
+                } else {
+                    (!s.id.starts_with("game:")).then(|| {
+                        self.rows.push((s.id.clone(), s.mode));
+                        Hit::Site(self.rows.len() - 1)
+                    })
+                };
                 let open = self.menu.as_ref().is_some_and(|m| m.id == s.id);
                 let v = match hit {
                     Some(hit) if row.bottom > top && row.top < H => {
@@ -1081,9 +1131,58 @@ impl Ui {
             }
             y += rh;
         }
+        // DNS for the neural networks: one of the choices is in use, like a row of radio buttons.
+        let dy = panel.bottom + 18.0;
+        let head = g.layout("// DNS ДЛЯ НЕЙРОСЕТЕЙ", Font::Mono, 10.5, 600, 0.0);
+        self.label(c, &head, 18.0, dy, t.mute, k);
+        self.dotted(c, 18.0 + metrics(&head).width + 8.0, W - 18.0, dy + 8.0, t.faint, k);
+        let system = status.map(|s| &s.dns);
+        let shown = config.cloned().unwrap_or_default();
+        let options = dns_options(&shown, system);
+        let item = 28.0;
+        let dns = rect(x, dy + 20.0, w, options.len() as f32 * item + 8.0);
+        self.panel(c, t, dns, k);
+        let a = if config.is_some() { k } else { 0.4 * k };
+        for (i, (name, note, chosen)) in options.iter().enumerate() {
+            let row = rect(x + 4.0, dns.top + 4.0 + i as f32 * item, w - 8.0, item);
+            let v = if config.is_some() { self.hov(Hit::Dns(i), now) } else { 0.0 };
+            c.fill_rect(row, t.hover, v * k);
+            let chosen = *chosen && config.is_some();
+            let mark = rect(row.left + 12.0, row.top + item / 2.0 - 3.0, 6.0, 6.0);
+            if chosen {
+                c.fill_rect(mark, t.ok, a);
+            } else {
+                c.stroke_round(mark, 0.0, t.mute, a, 1.0);
+            }
+            let l = g.layout(name, Font::Mono, 12.0, if chosen { 600 } else { 400 }, 0.0);
+            let m = metrics(&l);
+            c.text(&l, row.left + 28.0, row.top + (item - m.height) / 2.0, t.ink, a);
+            if !note.is_empty() {
+                let n = g.layout(note, Font::Mono, 10.0, 400, 0.0);
+                let nm = metrics(&n);
+                c.text(&n, row.right - 12.0 - nm.width, row.top + (item - nm.height) / 2.0, t.mute, a);
+            }
+            if config.is_some() {
+                self.hits.push((row, Hit::Dns(i)));
+            }
+        }
+        // What exactly the choice in use is: the numbers and the DoH address, to check or to copy by eye.
+        let (ips, doh) = dns_details(&shown, system);
+        let mut ly = dns.bottom + 8.0;
+        for (key, value) in [("IP ", ips), ("DoH", doh)] {
+            let kl = g.layout(key, Font::Mono, 10.0, 600, 0.0);
+            self.label(c, &kl, 18.0, ly, t.mute, a);
+            let vl = g.layout(&clip(&value, 50), Font::Mono, 10.0, 400, 0.0);
+            self.label(c, &vl, 46.0, ly, t.ink, a);
+            ly += 15.0;
+        }
+        let hint = g.layout("Свой: скопируйте адрес DoH или IP и нажмите «Свой»", Font::Mono, 10.0, 400, W - 40.0);
+        align(&hint, DWRITE_TEXT_ALIGNMENT_CENTER);
+        self.label(c, &hint, 20.0, ly + 4.0, t.mute, k);
+
         // The one thing to do with the bypass itself, on its own under the switches.
         let learning = status.is_some_and(|s| s.state == State::Learning);
-        let by = panel.bottom + 24.0;
+        let by = ly + 4.0 + metrics(&hint).height + 16.0;
         if status.is_some() {
             let label = if learning { "Остановить настройку" } else { "Настроить заново" };
             self.button(c, g, t, label, W / 2.0, by, 32.0, 12.0, Hit::Relearn, k);

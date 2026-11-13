@@ -1,16 +1,56 @@
 mod dns;
 mod http;
 mod net;
+mod resolver;
 mod tls;
 
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 pub use net::PortBlock;
+pub use resolver::{Resolver, public, qtype, reply};
 pub use tls::Hello;
 
 use dns::{doh_global, system_global};
 use http::End;
+
+/// The addresses the system resolver gives for a name.
+pub async fn system_addrs(host: &str) -> Vec<IpAddr> {
+    system_global(host).await
+}
+
+/// The addresses the well-known public resolvers give for a name, asked past the system one.
+pub async fn public_addrs(host: &str) -> Vec<IpAddr> {
+    doh_global(host, &[]).await
+}
+
+/// The country a site behind Cloudflare sees this computer in, when reached at `ip`: such sites
+/// answer `/cdn-cgi/trace` with it. None for a site that is not behind Cloudflare or does not answer.
+pub async fn seen_from(host: &str, ip: IpAddr) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let exchange = async {
+        let tcp = net::connect(ip, 443, None, Duration::from_secs(3)).await.ok()?;
+        let mut stream = tls::handshake(tcp, host, Duration::from_secs(3), Hello::Big).await.ok()?;
+        let request = format!("GET /cdn-cgi/trace HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.ok()?;
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        while raw.len() < 32 * 1024 {
+            match stream.read(&mut buf).await {
+                Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                _ => break,
+            }
+        }
+        let (status, body) = http::body(&raw)?;
+        if status != 200 {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&body);
+        let country = text.lines().find_map(|line| line.strip_prefix("loc="))?.trim();
+        (country.len() == 2 && country.bytes().all(|b| b.is_ascii_uppercase())).then(|| country.to_owned())
+    };
+    tokio::time::timeout(Duration::from_secs(8), exchange).await.ok().flatten()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {

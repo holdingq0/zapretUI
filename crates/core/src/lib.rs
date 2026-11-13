@@ -1,3 +1,4 @@
+pub mod aidns;
 pub mod config;
 pub mod ipc;
 pub mod memory;
