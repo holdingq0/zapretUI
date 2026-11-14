@@ -41,7 +41,10 @@ pub async fn serve(hub: Arc<Hub>) -> anyhow::Result<()> {
                     }
                 });
             }
-            Err(e) => tracing::warn!("pipe accept: {e}"),
+            Err(e) => {
+                tracing::warn!("pipe accept: {e}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
         }
     }
 }

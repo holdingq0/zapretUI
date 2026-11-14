@@ -2,7 +2,7 @@
 // and, where it answers there, over plain DNS on port 53.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -25,14 +25,16 @@ pub struct Resolver {
     /// The resolver's addresses; with none, the DoH host is looked up.
     ips: Vec<IpAddr>,
     plain: bool,
-    session: Mutex<Option<SendRequest<Bytes>>>,
+    /// The HTTP/2 connection kept open, with the number it was opened under.
+    session: Mutex<Option<(u64, SendRequest<Bytes>)>>,
+    opened: AtomicU64,
     /// DoH failed while port 53 answered: port 53 goes first until `retry_doh`.
     doh_down: AtomicBool,
 }
 
 impl Resolver {
     pub fn new(doh: Option<(String, u16, String)>, ips: Vec<IpAddr>, plain: bool) -> Self {
-        Self { doh, ips, plain, session: Mutex::new(None), doh_down: AtomicBool::new(false) }
+        Self { doh, ips, plain, session: Mutex::new(None), opened: AtomicU64::new(0), doh_down: AtomicBool::new(false) }
     }
 
     /// DoH gets another chance to be the first choice.
@@ -83,21 +85,25 @@ impl Resolver {
         let uri = if *port == 443 { format!("https://{host}{path}") } else { format!("https://{host}:{port}{path}") };
         // A connection kept from before may have been closed by the server: one more try on a new one.
         for _ in 0..2 {
-            let sender = self.session().await?;
+            let (id, sender) = self.session().await?;
             if let Ok(Some(answer)) = tokio::time::timeout(ANSWER, post(sender, &uri, query)).await {
                 return Some(answer);
             }
-            *self.session.lock().await = None;
+            // Only the connection this query went over: another query may have opened a new one since.
+            let mut slot = self.session.lock().await;
+            if slot.as_ref().is_some_and(|(open, _)| *open == id) {
+                *slot = None;
+            }
         }
         None
     }
 
     /// The HTTP/2 connection to the resolver, opened when there is none.
-    async fn session(&self) -> Option<SendRequest<Bytes>> {
+    async fn session(&self) -> Option<(u64, SendRequest<Bytes>)> {
         let (host, port, _) = self.doh.as_ref()?;
         let mut slot = self.session.lock().await;
-        if let Some(sender) = slot.as_ref() {
-            return Some(sender.clone());
+        if let Some(open) = slot.as_ref() {
+            return Some(open.clone());
         }
         let mut addrs = self.ips.clone();
         if addrs.is_empty() {
@@ -113,8 +119,9 @@ impl Resolver {
             tokio::spawn(async move {
                 let _ = connection.await;
             });
-            *slot = Some(sender.clone());
-            return Some(sender);
+            let open = (self.opened.fetch_add(1, Ordering::Relaxed), sender);
+            *slot = Some(open.clone());
+            return Some(open);
         }
         None
     }

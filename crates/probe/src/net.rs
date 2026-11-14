@@ -48,7 +48,11 @@ pub async fn connect(ip: IpAddr, port: u16, ports: Option<&PortBlock>, limit: Du
                     continue;
                 }
             }
-            return socket.connect(SocketAddr::new(ip, port)).await;
+            match socket.connect(SocketAddr::new(ip, port)).await {
+                // The port is free to bind but its last connection to this server is not gone yet.
+                Err(e) if ports.is_some() && local(&e) => last = Some(e),
+                other => return other,
+            }
         }
         Err(last.unwrap_or_else(|| io::Error::other("нет свободного локального порта")))
     };

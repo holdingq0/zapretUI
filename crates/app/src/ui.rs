@@ -481,6 +481,7 @@ impl Ui {
         }
     }
 
+    /// False when the render target is lost (a display or session change): the caller makes a new one.
     pub fn paint(
         &mut self,
         c: &mut Canvas,
@@ -490,7 +491,7 @@ impl Ui {
         connected: bool,
         status: Option<&Status>,
         config: Option<&Config>,
-    ) {
+    ) -> bool {
         let now = Instant::now();
         self.hits.clear();
         let status = status.filter(|_| connected);
@@ -559,9 +560,7 @@ impl Ui {
             self.field_dirty = true;
         }
         self.voids = voids;
-        unsafe {
-            let _ = c.rt.EndDraw(None, None);
-        }
+        unsafe { c.rt.EndDraw(None, None).is_ok() }
     }
 
     /// A dropdown under the status chip of the service it belongs to (above it near the bottom).

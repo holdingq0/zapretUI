@@ -628,7 +628,9 @@ fn paint(app: &mut App) {
     }
     let scale = main.dpi as f32 / 96.0;
     if let Some(canvas) = &mut main.canvas {
-        main.ui.paint(canvas, &main.gfx, theme, scale, shared.connected, shared.status.as_ref(), config.as_ref());
+        if !main.ui.paint(canvas, &main.gfx, theme, scale, shared.connected, shared.status.as_ref(), config.as_ref()) {
+            main.canvas = None;
+        }
     }
     // Windows may make the window active inside this app without letting it to the front (another app
     // holds the focus): only the real foreground window animates.

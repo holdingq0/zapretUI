@@ -27,6 +27,9 @@ pub async fn run(shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
         let hub = hub.clone();
         tokio::spawn(async move {
             let mut every = tokio::time::interval(Duration::from_secs(3));
+            // The clock runs through sleep on Windows: without this a night of missed ticks would
+            // all fire in a row on wake-up.
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 every.tick().await;
                 let hub = hub.clone();

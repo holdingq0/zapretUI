@@ -53,6 +53,8 @@ const STABLE_AFTER: Duration = Duration::from_secs(60);
 const TRIM_EVERY: Duration = Duration::from_secs(6 * 3600);
 /// How often the engine thread looks whether winws2 is still alive.
 const ENGINE_POLL: Duration = Duration::from_secs(1);
+/// How often the running processes are listed to see whether a game from the catalog is on.
+const PROCS_POLL: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone, PartialEq)]
 enum Problem {
@@ -103,6 +105,7 @@ struct Inner {
     verifying: BTreeSet<String>,
     restart_at: Option<Instant>,
     procs: BTreeSet<String>,
+    procs_polled: Option<Instant>,
     has_probed: bool,
     has_direct: bool,
     has_ipset: bool,
@@ -244,6 +247,7 @@ impl Hub {
                 verifying: BTreeSet::new(),
                 restart_at: None,
                 procs: BTreeSet::new(),
+                procs_polled: None,
                 has_probed: false,
                 has_direct: false,
                 has_ipset: false,
@@ -527,7 +531,16 @@ impl Hub {
 
     pub fn tick(&self) {
         self.poll_network();
-        let all = procs::running();
+        let procs_due = {
+            let mut inner = self.lock();
+            let due = inner.procs_polled.is_none_or(|at| at.elapsed() >= PROCS_POLL);
+            if due {
+                inner.procs_polled = Some(Instant::now());
+            }
+            due
+        };
+        // A snapshot of every process is not free; the lock is not held while it is taken.
+        let all = procs_due.then(procs::running);
         let mut inner = self.lock();
         let mut changed = false;
         if inner.trimmed.elapsed() >= TRIM_EVERY {
@@ -535,13 +548,15 @@ impl Hub {
             trim_events();
         }
 
-        let watched: BTreeSet<String> = targets::games()
-            .flat_map(|s| s.processes.iter().map(|p| p.to_ascii_lowercase()))
-            .filter(|p| all.contains(p))
-            .collect();
-        if watched != inner.procs {
-            inner.procs = watched;
-            changed = true;
+        if let Some(all) = all {
+            let watched: BTreeSet<String> = targets::games()
+                .flat_map(|s| s.processes.iter().map(|p| p.to_ascii_lowercase()))
+                .filter(|p| all.contains(p))
+                .collect();
+            if watched != inner.procs {
+                inner.procs = watched;
+                changed = true;
+            }
         }
 
         let hosts = read_autohostlist();
