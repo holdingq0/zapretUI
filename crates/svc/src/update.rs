@@ -28,7 +28,8 @@ use windows::core::{HSTRING, PCWSTR, w};
 use crate::hub::Hub;
 
 const RELEASE: &str = include_str!("../../../resources/release.toml");
-const FIRST_CHECK: Duration = Duration::from_secs(90);
+/// Past KEEP_OLD: the first look also clears what the last update left behind.
+const FIRST_CHECK: Duration = Duration::from_secs(150);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 const RETRY_BUSY: Duration = Duration::from_secs(20 * 60);
 const KEEP_OLD: Duration = Duration::from_secs(120);
@@ -528,10 +529,14 @@ async fn install(hub: &Hub, release: Release, keys: Vec<Vec<u8>>) {
 
 pub async fn run(hub: Arc<Hub>, mut asks: mpsc::UnboundedReceiver<Ask>) {
     // Files of the previous version stay until this one has run for a while: they are the way back.
-    tokio::spawn(async {
-        tokio::time::sleep(KEEP_OLD).await;
-        let _ = tokio::task::spawn_blocking(cleanup).await;
-    });
+    // They go between the checks of this loop, never in the middle of a download or an install,
+    // and again at every later turn: the old window may still run from its file for a while.
+    let keep_until = std::time::Instant::now() + KEEP_OLD;
+    let tidy = || async move {
+        if std::time::Instant::now() >= keep_until {
+            let _ = tokio::task::spawn_blocking(cleanup).await;
+        }
+    };
     if let Ok(version) = std::fs::read_to_string(marker()) {
         let _ = std::fs::remove_file(marker());
         if version.trim() == env!("CARGO_PKG_VERSION") {
@@ -540,6 +545,8 @@ pub async fn run(hub: Arc<Hub>, mut asks: mpsc::UnboundedReceiver<Ask>) {
         }
     }
     let Some((repo, keys)) = source() else {
+        tokio::time::sleep(KEEP_OLD).await;
+        tidy().await;
         while asks.recv().await.is_some() {}
         return;
     };
@@ -553,6 +560,7 @@ pub async fn run(hub: Arc<Hub>, mut asks: mpsc::UnboundedReceiver<Ask>) {
             Err(_) => None,
         };
         wait = CHECK_EVERY;
+        tidy().await;
         match ask {
             // The button in the window or the tray: install what was found, or look first.
             Some(Ask::Install) => {

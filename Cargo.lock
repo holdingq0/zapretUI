@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "rkn-app"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "rkn-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "serde",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "rkn-engine"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "rkn-core",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "rkn-probe"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "rkn-search"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "rkn-core",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "rkn-setup"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "rkn-svc"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "ring",

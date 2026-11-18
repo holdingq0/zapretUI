@@ -146,6 +146,19 @@ fn window_of(service_portable: bool) -> std::path::PathBuf {
     }
 }
 
+/// An exe file by its length and time of writing: a different pair is a different build.
+fn file_id(path: &std::path::Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// The file this copy was started from, as it was then. An update moves it aside and puts the new
+/// build under the same name, while this process keeps running the old one.
+fn own_file() -> Option<(u64, std::time::SystemTime)> {
+    static OWN: std::sync::OnceLock<Option<(u64, std::time::SystemTime)>> = std::sync::OnceLock::new();
+    *OWN.get_or_init(|| std::env::current_exe().ok().and_then(|exe| file_id(&exe)))
+}
+
 fn hand_over(tray: bool, updated: bool) {
     if with(|app| std::mem::replace(&mut app.leaving, true)).unwrap_or(true) {
         return;
@@ -279,6 +292,7 @@ fn main() {
             return;
         }
     }
+    own_file();
     if !paths::portable() {
         autostart::migrate();
     }
@@ -479,9 +493,11 @@ fn on_update(app: &mut App) {
     let version = service.as_ref().map(|(v, _)| v.clone());
     if let Some((version, service_portable)) = &service {
         let target = window_of(*service_portable);
-        let fresh = std::env::args().any(|a| a == "--updated");
-        // The service updated itself and the window next to it: hand over to the new copy, once.
-        let updated = paths::newer(version, env!("CARGO_PKG_VERSION")) && !fresh;
+        // The service updated itself and the window next to it: hand over to the new copy. Only to
+        // another file than this copy's own: a window the update did not replace would otherwise
+        // start itself again and again. Not a flag on the command line: a window started by a
+        // handover must still follow the next update, which may come minutes later.
+        let updated = paths::newer(version, env!("CARGO_PKG_VERSION")) && file_id(&target) != own_file();
         // A portable copy started while the installed program runs: both are one service, and the
         // installed window is the one that matches it and gets its updates.
         let foreign = paths::portable() && !service_portable;
