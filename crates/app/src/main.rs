@@ -163,11 +163,17 @@ fn hand_over(tray: bool, updated: bool) {
     if with(|app| std::mem::replace(&mut app.leaving, true)).unwrap_or(true) {
         return;
     }
-    let service_portable = with(|app| {
+    let (service_portable, service_version) = with(|app| {
         let shared = app.store.lock().unwrap_or_else(|e| e.into_inner());
-        shared.status.as_ref().is_none_or(|s| s.portable)
+        (shared.status.as_ref().is_none_or(|s| s.portable), shared.status.as_ref().map(|s| s.version.clone()).unwrap_or_default())
     })
-    .unwrap_or(true);
+    .unwrap_or((true, String::new()));
+    // A portable copy newer than the installed program it gives way to: whoever started it wants
+    // this version, so the installed service is asked to update first (it downloads and checks the
+    // release itself). Its window, opened now, follows the update when it is in place.
+    if paths::portable() && !service_portable && paths::newer(env!("CARGO_PKG_VERSION"), &service_version) {
+        let _ = pipe::request(&Request::InstallUpdate);
+    }
     let mut cmd = std::process::Command::new(window_of(service_portable));
     cmd.arg("--replace");
     if updated {
