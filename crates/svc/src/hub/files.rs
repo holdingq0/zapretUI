@@ -53,6 +53,10 @@ pub(super) fn sync_lists(inner: &mut Inner) {
     inner.has_ipset = !ipset.is_empty();
     for (path, list) in [(paths::probed_file(), probed), (paths::direct_file(), direct), (engine::ipset_file(), ipset)] {
         let body: String = list.iter().map(|h| format!("{h}\n")).collect();
+        // winws2 rereads a list whose file changed: the same contents are not written again.
+        if std::fs::read_to_string(&path).is_ok_and(|old| old == body) {
+            continue;
+        }
         if let Err(e) = paths::write_atomic(&path, &body) {
             tracing::warn!("{}: {e}", path.display());
         }

@@ -252,7 +252,14 @@ pub fn baseline(layout: &IDWriteTextLayout) -> f32 {
     let mut lines = [DWRITE_LINE_METRICS::default()];
     let mut count = 0u32;
     unsafe {
-        let _ = layout.GetLineMetrics(Some(&mut lines), &mut count);
+        // A text of several lines does not fit one entry: the call fails, says how many it needs,
+        // and DirectWrite does not promise to fill the first one then.
+        if layout.GetLineMetrics(Some(&mut lines), &mut count).is_err() && count > 1 {
+            let mut all = vec![DWRITE_LINE_METRICS::default(); count as usize];
+            if layout.GetLineMetrics(Some(&mut all), &mut count).is_ok() {
+                return all[0].baseline;
+            }
+        }
     }
     lines[0].baseline
 }

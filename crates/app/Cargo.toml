@@ -16,6 +16,8 @@ embed-resource = "3"
 rkn-core.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
+# SHA-256 of the files the portable exe unpacks.
+ring = "0.17"
 windows-numerics = "0.3"
 windows = { workspace = true, features = [
   "Win32_Graphics_Direct2D",

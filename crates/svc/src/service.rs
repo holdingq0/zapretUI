@@ -35,7 +35,22 @@ pub fn run_portable(after: Option<u32>) -> anyhow::Result<()> {
     if let Some(pid) = after {
         wait_exit(pid);
     }
+    mark_version();
     runtime()?.block_on(app::run(window_gone()))
+}
+
+/// The marker of a portable copy says which version its folder holds: zapretUI-portable.exe does not
+/// unpack an older version over a copy that has updated itself. A version rolled back after a
+/// failed update starts here again and puts its own number back.
+fn mark_version() {
+    let Some(root) = paths::portable_root() else { return };
+    let mark = root.join(paths::PORTABLE_MARK);
+    let version = env!("CARGO_PKG_VERSION");
+    if std::fs::read_to_string(&mark).map(|v| v.trim() != version).unwrap_or(true) {
+        if let Err(e) = paths::write_atomic(&mark, version) {
+            tracing::warn!("{}: {e}", mark.display());
+        }
+    }
 }
 
 pub fn wait_exit(pid: u32) {

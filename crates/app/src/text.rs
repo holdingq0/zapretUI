@@ -53,7 +53,10 @@ pub fn view(connected: bool, missing: bool, stopped: bool, launching: bool, stat
     match status.state {
         State::Working => {
             // How many services go through the bypass is on the badge of the "Services" button.
-            let sub = if bypassed(status) > 0 {
+            // The service's word comes first: another bypass running next to this one, say.
+            let sub = if let Some(text) = message() {
+                text
+            } else if bypassed(status) > 0 {
                 String::new()
             } else if status.sites.iter().any(|s| s.state == SiteState::Checking) {
                 "Проверяю, что режет провайдер".into()
@@ -63,7 +66,7 @@ pub fn view(connected: bool, missing: bool, stopped: bool, launching: bool, stat
             v("Включено", sub, None)
         }
         State::Paused => v("Выключено", String::new(), None),
-        State::Starting => v("Запуск", "Включаю обход".into(), None),
+        State::Starting => v("Запуск", message().unwrap_or_else(|| "Включаю обход".into()), None),
         State::Learning => {
             // While it looks at the sites, the line says why the search started; then what it does.
             let sub = match status.learn.as_ref() {

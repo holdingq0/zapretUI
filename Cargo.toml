@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/engine", "crates/probe", "crates/search", "crates/svc", "crates/app", "crates/setup", "crates/xtask"]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -14,7 +14,6 @@ rkn-engine = { path = "crates/engine" }
 rkn-probe = { path = "crates/probe" }
 rkn-search = { path = "crates/search" }
 anyhow = "1"
-thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"

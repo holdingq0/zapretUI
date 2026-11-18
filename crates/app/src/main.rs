@@ -15,6 +15,7 @@ mod text;
 mod theme;
 mod tray;
 mod ui;
+mod unpack;
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
@@ -251,7 +252,12 @@ fn xy(l: LPARAM) -> (i32, i32) {
 }
 
 fn main() {
+    // zapretUI-portable.exe: brings its folder up to date and starts the window from there.
+    if unpack::run() {
+        return;
+    }
     unsafe {
+        // The manifest already asks for this; the call covers a build without it.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }

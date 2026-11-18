@@ -1,21 +1,28 @@
-// A release has two files: the installer and the portable zip. The installer carries the program
-// as a signed pack appended to its end, and the updater downloads the same installer to take the
-// pack from it. The pack: the manifest (version, every file with its size and sha256), an Ed25519
+// A release has two files: the installer and the portable program, one exe each. Both carry the
+// program as the same signed pack appended to their end: the installer puts it in Program Files,
+// the portable exe next to itself, and the updater takes it from the installer, only the parts of
+// it that changed. The pack: the manifest (version, every file with its size and sha256), an Ed25519
 // signature of the manifest made with the key whose public half is built into the program, then
 // the files in manifest order.
 //
 //   pack:    "ZUIUPD01" | manifest length (u32 LE) | manifest JSON | signature (64 bytes) | files
-//   trailer: installer exe | pack | pack offset (u64 LE) | "ZUITAIL1"
+//   trailer: exe | pack | pack offset (u64 LE) | "ZUITAIL1"
 
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 8] = b"ZUIUPD01";
 const TAIL: &[u8; 8] = b"ZUITAIL1";
 pub const SIGNATURE_LEN: usize = 64;
+/// The end of an exe with a pack: where the pack starts, and the mark.
+pub const TRAILER_LEN: usize = 16;
 
 pub fn setup_asset(version: &str) -> String {
     format!("zapretUI-setup-{version}.exe")
 }
+
+/// The portable program. No version in the name: it updates the folder it unpacks itself into, and
+/// "releases/latest/download/zapretUI-portable.exe" always is the newest.
+pub const PORTABLE_ASSET: &str = "zapretUI-portable.exe";
 
 /// The installer with the pack appended; Windows ignores data past the end of an exe image.
 pub fn attach(exe: &[u8], pack: &[u8]) -> Vec<u8> {
@@ -27,12 +34,33 @@ pub fn attach(exe: &[u8], pack: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The pack appended to an installer, if there is one.
+/// Where the pack starts, read from the last TRAILER_LEN bytes of an exe; None without a pack.
+pub fn pack_offset(trailer: &[u8]) -> Option<u64> {
+    let offset = trailer.strip_suffix(TAIL.as_slice())?;
+    Some(u64::from_le_bytes(offset.try_into().ok()?))
+}
+
+/// The pack appended to an exe, if there is one.
 pub fn attached(bytes: &[u8]) -> Option<&[u8]> {
-    let body = bytes.strip_suffix(TAIL.as_slice())?;
-    let at = body.len().checked_sub(8)?;
-    let offset = usize::try_from(u64::from_le_bytes(body[at..].try_into().ok()?)).ok()?;
-    body.get(offset..at)
+    let at = bytes.len().checked_sub(TRAILER_LEN)?;
+    let offset = usize::try_from(pack_offset(&bytes[at..])?).ok()?;
+    bytes.get(offset..at)
+}
+
+/// Whether the file ends with a pack. Reads only its last bytes.
+pub fn carries_pack(path: &std::path::Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut trailer = [0u8; TRAILER_LEN];
+    file.seek(SeekFrom::End(-(TRAILER_LEN as i64))).is_ok() && file.read_exact(&mut trailer).is_ok() && pack_offset(&trailer).is_some()
+}
+
+/// The length of the pack's head (magic, manifest length, manifest, signature), once `bytes`, the
+/// start of a pack, hold the manifest length. The files follow right after it.
+pub fn head_len(bytes: &[u8]) -> Option<usize> {
+    let rest = bytes.strip_prefix(MAGIC.as_slice())?;
+    let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    Some(MAGIC.len() + 4 + len + SIGNATURE_LEN)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +156,9 @@ mod tests {
 
         let found = attached(&whole).unwrap();
         assert_eq!(found, &packed[..]);
+        assert_eq!(pack_offset(&whole[whole.len() - TRAILER_LEN..]), Some(exe.len() as u64));
+        let head = head_len(found).unwrap();
+        assert_eq!(&found[head..], b"abcde");
         let (got_manifest, got_signature, files) = unpack(found).unwrap();
         assert_eq!(got_manifest, &body[..]);
         assert_eq!(got_signature, &signature[..]);
@@ -138,6 +169,8 @@ mod tests {
     fn broken_input_is_refused() {
         let manifest = manifest();
         assert!(attached(b"MZ installer without a pack").is_none());
+        assert!(pack_offset(b"0123456789abcdef").is_none());
+        assert!(head_len(b"ZUIUPD01\x01\x00").is_none());
         assert!(unpack(b"ZUIUPD01\x01\x00").is_none());
         assert!(unpack(b"not a pack at all").is_none());
         assert!(split(&manifest, b"abcd").is_none(), "too short");

@@ -1,6 +1,9 @@
-// Updates from GitHub Releases. The service checks the latest release now and then, downloads the
-// files that changed, and installs them only when manifest.json carries a valid signature of the key
-// built into this binary and every file matches its hash. Then a fresh copy of the service restarts it.
+// Updates from GitHub Releases. The service checks the latest release now and then and takes the new
+// version out of its installer (rkn_core::release): the trailer, the signed manifest, then only the
+// files that differ from the ones in place, each by its own byte range. A server that does not give
+// ranges gets the whole installer downloaded. Nothing is installed unless the manifest carries a
+// valid signature of a key built into this binary and every file matches its hash. Then a fresh copy
+// of the service restarts it.
 
 use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
@@ -11,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, ensure};
 use rkn_core::ipc::{Level, UpdateState};
 use rkn_core::paths;
-use rkn_core::release::{FileEntry, Manifest, Place, attached, setup_asset, split, unhex, unpack};
+use rkn_core::release::{FileEntry, Manifest, Place, TRAILER_LEN, attached, head_len, pack_offset, setup_asset, split, unhex, unpack};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use windows::Win32::Networking::WinHttp::{
@@ -30,6 +33,8 @@ const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 const RETRY_BUSY: Duration = Duration::from_secs(20 * 60);
 const KEEP_OLD: Duration = Duration::from_secs(120);
 const MAX_UPDATE: usize = 128 * 1024 * 1024;
+/// The first read of a pack: the manifest of a release is a few kilobytes and fits in it.
+const HEAD_GUESS: u64 = 64 * 1024;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
@@ -81,6 +86,9 @@ struct Release {
 struct Asset {
     name: String,
     browser_download_url: String,
+    /// Bytes; 0 when GitHub did not say, and then the file is downloaded whole.
+    #[serde(default)]
+    size: u64,
 }
 
 impl Release {
@@ -117,7 +125,8 @@ impl Drop for Handle {
 }
 
 /// One HTTPS GET through WinHTTP: system proxy settings, redirects and TLS come from Windows.
-fn get(url: &str, accept: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
+/// `range`: only bytes `from..=to`, and the answer must be 206 with exactly them.
+fn get(url: &str, accept: &str, range: Option<(u64, u64)>, limit: usize) -> anyhow::Result<Vec<u8>> {
     let rest = url.strip_prefix("https://").context("адрес не https")?;
     let (host, path) = match rest.split_once('/') {
         Some((host, path)) => (host, format!("/{path}")),
@@ -140,7 +149,11 @@ fn get(url: &str, accept: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
             WINHTTP_FLAG_SECURE,
         ));
         ensure!(!request.0.is_null(), "запрос к {host} не создан");
-        let headers: Vec<u16> = format!("Accept: {accept}\r\n").encode_utf16().collect();
+        let mut headers = format!("Accept: {accept}\r\n");
+        if let Some((from, to)) = range {
+            headers.push_str(&format!("Range: bytes={from}-{to}\r\n"));
+        }
+        let headers: Vec<u16> = headers.encode_utf16().collect();
         WinHttpAddRequestHeaders(request.0, &headers, WINHTTP_ADDREQ_FLAG_ADD)?;
         WinHttpSendRequest(request.0, None, None, 0, 0, 0).with_context(|| format!("нет связи с {host}"))?;
         WinHttpReceiveResponse(request.0, std::ptr::null_mut()).with_context(|| format!("{host} не ответил"))?;
@@ -154,7 +167,10 @@ fn get(url: &str, accept: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
             &mut size,
             std::ptr::null_mut(),
         )?;
-        if code != 200 {
+        // A server that ignores the range answers 200 with the whole file: not read, the caller
+        // downloads it the plain way.
+        let expected = if range.is_some() { 206 } else { 200 };
+        if code != expected {
             return Err(HttpStatus(code).into());
         }
         let mut body: Vec<u8> = Vec::new();
@@ -171,8 +187,20 @@ fn get(url: &str, accept: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
             WinHttpReadData(request.0, body[start..].as_mut_ptr().cast(), available, &mut read)?;
             body.truncate(start + read as usize);
         }
+        if let Some((from, to)) = range {
+            ensure!(body.len() as u64 == to - from + 1, "сервер прислал не тот кусок файла");
+        }
         Ok(body)
     }
+}
+
+/// Bytes `from..from + len` of the file at `url`.
+fn get_range(url: &str, from: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = usize::try_from(len).ok().filter(|l| *l <= MAX_UPDATE).context("кусок файла слишком большой")?;
+    get(url, "application/octet-stream", Some((from, from + len - 1)), limit)
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -196,7 +224,7 @@ fn target(entry: &FileEntry) -> anyhow::Result<PathBuf> {
 
 fn latest(repo: &str) -> anyhow::Result<Option<Release>> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    match get(&url, "application/vnd.github+json", 1024 * 1024) {
+    match get(&url, "application/vnd.github+json", None, 1024 * 1024) {
         Ok(body) => {
             let release: Release = serde_json::from_slice(&body).context("ответ GitHub")?;
             Ok((!release.draft && !release.prerelease).then_some(release))
@@ -207,36 +235,100 @@ fn latest(repo: &str) -> anyhow::Result<Option<Release>> {
     }
 }
 
-/// Downloads and checks everything the release changes; returns the files to put in place.
-fn download(release: &Release, keys: &[Vec<u8>]) -> anyhow::Result<Vec<(FileEntry, PathBuf)>> {
-    // The new version comes inside its installer.
-    let asset = release.asset(&setup_asset(release.version()))?;
-    let bytes = get(&asset.browser_download_url, "application/octet-stream", MAX_UPDATE)?;
-    let (manifest_bytes, signature, body) = attached(&bytes).and_then(unpack).context("установщик новой версии повреждён")?;
+/// The manifest, once its signature checks out with one of `keys` and it is the release asked for.
+fn verified(manifest_bytes: &[u8], signature: &[u8], keys: &[Vec<u8>], version: &str) -> anyhow::Result<Manifest> {
     let signed = keys.iter().any(|key| {
         ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key).verify(manifest_bytes, signature).is_ok()
     });
     ensure!(signed, "подпись обновления не совпадает, обновление отклонено");
     let manifest: Manifest = serde_json::from_slice(manifest_bytes).context("список файлов обновления")?;
-    ensure!(manifest.version == release.version(), "версия в обновлении не совпадает с релизом");
+    ensure!(manifest.version == version, "версия в обновлении не совпадает с релизом");
     ensure!(paths::newer(&manifest.version, env!("CARGO_PKG_VERSION")), "релиз не новее установленной версии");
+    Ok(manifest)
+}
 
+/// The file in place already is the one of the release.
+fn unchanged(entry: &FileEntry) -> anyhow::Result<bool> {
+    Ok(sha256_file(&target(entry)?).is_some_and(|h| h.eq_ignore_ascii_case(&entry.sha256)))
+}
+
+/// The download folder, empty.
+fn staging() -> anyhow::Result<PathBuf> {
     let dir = paths::update_dir();
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Checks one file of the release against its hash and keeps it in the download folder.
+fn stage(dir: &Path, n: usize, entry: &FileEntry, data: &[u8]) -> anyhow::Result<(FileEntry, PathBuf)> {
+    ensure!(sha256(data).eq_ignore_ascii_case(&entry.sha256), "{} повреждён", entry.path);
+    let file = dir.join(n.to_string());
+    std::fs::write(&file, data)?;
+    Ok((entry.clone(), file))
+}
+
+/// Downloads and checks everything the release changes; returns the files to put in place.
+fn download(release: &Release, keys: &[Vec<u8>]) -> anyhow::Result<Vec<(FileEntry, PathBuf)>> {
+    // The new version comes inside its installer.
+    let asset = release.asset(&setup_asset(release.version()))?;
+    let files = match download_parts(asset, keys, release.version()) {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::info!("update by parts: {e:#}; downloading the whole installer");
+            download_whole(asset, keys, release.version())?
+        }
+    };
+    ensure!(!files.is_empty(), "в релизе нет изменённых файлов");
+    Ok(files)
+}
+
+/// Only what changed: an update of the app and the service leaves the engine, about half of the
+/// installer, where it is.
+fn download_parts(asset: &Asset, keys: &[Vec<u8>], version: &str) -> anyhow::Result<Vec<(FileEntry, PathBuf)>> {
+    let url = asset.browser_download_url.as_str();
+    let size = asset.size;
+    ensure!(size > TRAILER_LEN as u64 && size <= MAX_UPDATE as u64, "размер установщика неизвестен");
+    let end = size - TRAILER_LEN as u64;
+    let offset = pack_offset(&get_range(url, end, TRAILER_LEN as u64)?).context("в установщике нет программы")?;
+    ensure!(offset < end, "установщик новой версии повреждён");
+    let mut head = get_range(url, offset, HEAD_GUESS.min(end - offset))?;
+    let head_size = head_len(&head).context("установщик новой версии повреждён")?;
+    if head.len() < head_size {
+        ensure!(offset + head_size as u64 <= end, "установщик новой версии повреждён");
+        head = get_range(url, offset, head_size as u64)?;
+    }
+    let (manifest_bytes, signature, _) = unpack(&head[..head_size]).context("установщик новой версии повреждён")?;
+    let manifest = verified(manifest_bytes, signature, keys, version)?;
+    let total = manifest.files.iter().try_fold(0u64, |sum, f| sum.checked_add(f.size)).context("размеры файлов")?;
+    ensure!(offset + head_size as u64 + total == end, "размеры файлов в установщике не сходятся");
+
+    let dir = staging()?;
     let mut out = Vec::new();
-    let parts = split(&manifest, body).context("файл обновления обрезан")?;
-    for (n, (entry, data)) in manifest.files.iter().zip(parts).enumerate() {
-        ensure!(sha256(data).eq_ignore_ascii_case(&entry.sha256), "{} повреждён", entry.path);
-        let to = target(entry)?;
-        if sha256_file(&to).is_some_and(|h| h.eq_ignore_ascii_case(&entry.sha256)) {
+    let mut at = offset + head_size as u64;
+    for (n, entry) in manifest.files.iter().enumerate() {
+        let from = at;
+        at += entry.size;
+        if unchanged(entry)? {
             continue;
         }
-        let file = dir.join(n.to_string());
-        std::fs::write(&file, data)?;
-        out.push((entry.clone(), file));
+        out.push(stage(&dir, n, entry, &get_range(url, from, entry.size)?)?);
     }
-    ensure!(!out.is_empty(), "в релизе нет изменённых файлов");
+    Ok(out)
+}
+
+fn download_whole(asset: &Asset, keys: &[Vec<u8>], version: &str) -> anyhow::Result<Vec<(FileEntry, PathBuf)>> {
+    let bytes = get(&asset.browser_download_url, "application/octet-stream", None, MAX_UPDATE)?;
+    let (manifest_bytes, signature, body) = attached(&bytes).and_then(unpack).context("установщик новой версии повреждён")?;
+    let manifest = verified(manifest_bytes, signature, keys, version)?;
+    let parts = split(&manifest, body).context("файл обновления обрезан")?;
+    let dir = staging()?;
+    let mut out = Vec::new();
+    for (n, (entry, data)) in manifest.files.iter().zip(parts).enumerate() {
+        if !unchanged(entry)? {
+            out.push(stage(&dir, n, entry, data)?);
+        }
+    }
     Ok(out)
 }
 

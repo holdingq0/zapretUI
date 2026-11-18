@@ -55,6 +55,9 @@ const TRIM_EVERY: Duration = Duration::from_secs(6 * 3600);
 const ENGINE_POLL: Duration = Duration::from_secs(1);
 /// How often the running processes are listed to see whether a game from the catalog is on.
 const PROCS_POLL: Duration = Duration::from_secs(12);
+/// Other DPI bypasses on WinDivert. Two of them on the same packets break each other: the sites open
+/// or not by chance, and a search measures nothing.
+const RIVALS: [(&str, &str); 2] = [("winws.exe", "zapret (winws.exe)"), ("goodbyedpi.exe", "GoodbyeDPI")];
 
 #[derive(Debug, Clone, PartialEq)]
 enum Problem {
@@ -106,6 +109,8 @@ struct Inner {
     restart_at: Option<Instant>,
     procs: BTreeSet<String>,
     procs_polled: Option<Instant>,
+    /// Other bypasses running now (RIVALS), by name.
+    rivals: Vec<String>,
     has_probed: bool,
     has_direct: bool,
     has_ipset: bool,
@@ -248,6 +253,7 @@ impl Hub {
                 restart_at: None,
                 procs: BTreeSet::new(),
                 procs_polled: None,
+                rivals: Vec::new(),
                 has_probed: false,
                 has_direct: false,
                 has_ipset: false,
@@ -555,6 +561,16 @@ impl Hub {
                 .collect();
             if watched != inner.procs {
                 inner.procs = watched;
+                changed = true;
+            }
+            let rivals: Vec<String> = RIVALS.iter().filter(|(exe, _)| all.contains(*exe)).map(|(_, name)| name.to_string()).collect();
+            if rivals != inner.rivals {
+                let new: Vec<&String> = rivals.iter().filter(|r| !inner.rivals.contains(r)).collect();
+                if !new.is_empty() {
+                    let names = new.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(", ");
+                    self.emit(Event::new(Level::Warn, format!("Запущен ещё один обход: {names}. Вместе они мешают друг другу")));
+                }
+                inner.rivals = rivals;
                 changed = true;
             }
         }

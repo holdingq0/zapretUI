@@ -1,9 +1,9 @@
 // Release tooling, run by hand on the developer's machine:
 //   cargo xtask keygen             once: makes the signing key, writes its public half to resources/release.toml
 //   cargo xtask release [--dry-run] [--notes FILE]
-//                                  builds the installer (with the signed program attached, which the
-//                                  updater also uses) and the portable zip, publishes them as GitHub
-//                                  release v<version> via `gh`
+//                                  builds the installer and the one-file portable program (both with
+//                                  the same signed program attached, which the updater also uses),
+//                                  publishes them as GitHub release v<version> via `gh`
 // The private key stays in %USERPROFILE%\.zapretUI\release.key and never enters the repository.
 
 use std::path::{Path, PathBuf};
@@ -12,8 +12,8 @@ use std::process::Command;
 use anyhow::{Context, bail, ensure};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
-use rkn_core::paths::{APP_EXE, PORTABLE_MARK, PRODUCT, SERVICE_EXE};
-use rkn_core::release::{FileEntry, Manifest, Place, attach, attached, hex, pack, setup_asset, split, unhex, unpack};
+use rkn_core::paths::{APP_EXE, PRODUCT, SERVICE_EXE};
+use rkn_core::release::{FileEntry, Manifest, PORTABLE_ASSET, Place, attach, attached, hex, pack, setup_asset, split, unhex, unpack};
 use serde::Deserialize;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -104,44 +104,23 @@ fn engine_files(src: &Path) -> anyhow::Result<Vec<String>> {
     Ok(files)
 }
 
-fn copy(from: &Path, to: &Path) -> anyhow::Result<()> {
-    if let Some(dir) = to.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::copy(from, to).with_context(|| format!("копирование {}", from.display()))?;
-    Ok(())
-}
-
-/// Reads the installer back the way the installer and the updater will: the attached pack, its
-/// signature against the public key in release.toml, the version, every file against its hash.
-fn check_setup(path: &Path, public: &str) -> anyhow::Result<()> {
+/// Reads an exe back the way the installer, the portable exe and the updater will: the attached
+/// pack, its signature against the public key in release.toml, the version, every file against its hash.
+fn check_pack(path: &Path, public: &str) -> anyhow::Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let bytes = std::fs::read(path)?;
-    let (manifest_bytes, signature, body) = attached(&bytes).and_then(unpack).context("в установщике нет программы")?;
+    let (manifest_bytes, signature, body) = attached(&bytes).and_then(unpack).with_context(|| format!("в {name} нет программы"))?;
     let key = unhex(public).context("ключ в release.toml")?;
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
         .verify(manifest_bytes, signature)
-        .map_err(|_| anyhow::anyhow!("подпись в установщике не сходится с ключом"))?;
+        .map_err(|_| anyhow::anyhow!("подпись в {name} не сходится с ключом"))?;
     let manifest: Manifest = serde_json::from_slice(manifest_bytes)?;
-    ensure!(manifest.version == VERSION, "версия в установщике не {VERSION}");
-    let parts = split(&manifest, body).context("размеры файлов в установщике не сходятся")?;
+    ensure!(manifest.version == VERSION, "версия в {name} не {VERSION}");
+    let parts = split(&manifest, body).with_context(|| format!("размеры файлов в {name} не сходятся"))?;
     for (entry, data) in manifest.files.iter().zip(parts) {
         ensure!(hex(ring::digest::digest(&ring::digest::SHA256, data).as_ref()) == entry.sha256, "{} не совпадает с хешем", entry.path);
     }
-    println!("Установщик проверен: {} файлов внутри, подпись верна", manifest.files.len());
-    Ok(())
-}
-
-fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let path = entry?.path();
-        let target = to.join(path.file_name().context("имя файла")?);
-        if path.is_dir() {
-            copy_tree(&path, &target)?;
-        } else {
-            copy(&path, &target)?;
-        }
-    }
+    println!("{name} проверен: {} файлов внутри, подпись верна, {:.1} МБ", manifest.files.len(), bytes.len() as f64 / 1048576.0);
     Ok(())
 }
 
@@ -164,44 +143,35 @@ fn release(dry_run: bool, notes: Option<PathBuf>) -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&dist);
     std::fs::create_dir_all(&dist)?;
 
-    // The program as it is laid out on disk: the payload of the installer and the portable folder.
-    let program = dist.join("program");
+    // The program: the app, the service and the engine, in the order of the manifest.
     let mut entries: Vec<(FileEntry, PathBuf)> = Vec::new();
     for exe in [APP_EXE, SERVICE_EXE] {
-        copy(&built.join(exe), &program.join(exe))?;
-        let entry = FileEntry { place: Place::Bin, path: exe.to_string(), size: std::fs::metadata(built.join(exe))?.len(), sha256: sha256(&built.join(exe))? };
-        entries.push((entry, built.join(exe)));
+        let from = built.join(exe);
+        let entry = FileEntry { place: Place::Bin, path: exe.to_string(), size: std::fs::metadata(&from)?.len(), sha256: sha256(&from)? };
+        entries.push((entry, from));
     }
     for file in engine_files(&winws2)? {
         let from = file.split('/').fold(winws2.clone(), |p, part| p.join(part));
-        copy(&from, &file.split('/').fold(program.join("winws2"), |p, part| p.join(part)))?;
         let entry = FileEntry { place: Place::Engine, path: file.clone(), size: std::fs::metadata(&from)?.len(), sha256: sha256(&from)? };
         entries.push((entry, from));
     }
 
     run(Command::new("cargo").current_dir(root()).args(["build", "--release", "-p", "rkn-setup"]))?;
 
-    // The portable copy: the same files, the marker, the license, packed into a zip.
-    let name = format!("{PRODUCT}-portable-{VERSION}");
-    let portable = dist.join(&name);
-    copy_tree(&program, &portable)?;
-    std::fs::write(portable.join(PORTABLE_MARK), "")?;
-    if root().join("LICENSE").is_file() {
-        copy(&root().join("LICENSE"), &portable.join("LICENSE"))?;
-    }
-    let zip = dist.join(format!("{name}.zip"));
-    run(Command::new("tar").current_dir(&dist).arg("-a").arg("-c").arg("-f").arg(&zip).arg(&name))?;
-
-    // The installer: the program as a signed pack appended to it. The updater downloads the same file.
+    // One signed pack, attached to two carriers: the installer (which the updater downloads too)
+    // and the app itself, which as zapretUI-portable.exe unpacks the program next to itself.
     let manifest = Manifest { version: VERSION.to_string(), files: entries.iter().map(|(e, _)| e.clone()).collect() };
     let body = serde_json::to_vec(&manifest)?;
     let contents = entries.iter().map(|(_, from)| std::fs::read(from)).collect::<Result<Vec<_>, _>>()?;
     let pack = pack(&body, pair.sign(&body).as_ref(), &contents);
     let setup = dist.join(setup_asset(VERSION));
     std::fs::write(&setup, attach(&std::fs::read(built.join(format!("{PRODUCT}-setup.exe")))?, &pack))?;
-    check_setup(&setup, &source.key)?;
+    check_pack(&setup, &source.key)?;
+    let portable = dist.join(PORTABLE_ASSET);
+    std::fs::write(&portable, attach(&app, &pack))?;
+    check_pack(&portable, &source.key)?;
 
-    let files: Vec<PathBuf> = vec![setup, zip];
+    let files: Vec<PathBuf> = vec![setup, portable];
     println!("Готово: {}", dist.display());
     if dry_run {
         println!("--dry-run: релиз {tag} не опубликован");

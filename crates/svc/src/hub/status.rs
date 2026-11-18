@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// Another bypass runs next to this one: what the window says while everything else is fine.
+fn rivals(inner: &Inner) -> Option<String> {
+    (!inner.rivals.is_empty())
+        .then(|| format!("Запущен ещё {}: два обхода мешают друг другу. Закройте его", inner.rivals.join(" и ")))
+}
+
 pub(super) fn status(inner: &mut Inner) -> Status {
     let running = inner.up;
     let mut unfixed = inner.memory.as_ref().map(|m| m.unfixed.clone()).unwrap_or_default();
@@ -25,8 +31,8 @@ pub(super) fn status(inner: &mut Inner) -> Status {
                 unique(unfixed.iter().filter(|h| !targets::background(h)).map(|h| targets::name(h)))
             )),
         ),
-        None if !inner.planned || running => (State::Working, None),
-        None => (State::Starting, None),
+        None if !inner.planned || running => (State::Working, rivals(inner)),
+        None => (State::Starting, rivals(inner)),
     };
 
     let mut hosts: BTreeSet<String> = inner.hosts.clone();
